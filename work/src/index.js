@@ -59,7 +59,7 @@ export default {
       if (!authHeader) return false;
       const [scheme, encoded] = authHeader.split(' ');
       if (scheme !== 'Basic' || !encoded) return false;
-      const credentials = Buffer.from(encoded, 'base64').toString();
+      const credentials = atob(encoded);
       const [user, pass] = credentials.split(':');
       return user === 'admin' && pass === BASIC_PASS;
     };
