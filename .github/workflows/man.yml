@@ -1,18 +1,16 @@
-name: Build and Push to work folder
+name: Deploy to Cloudflare Workers
 
 on:
   push:
-    branches: [ main ]          # 当 main 更新时触发
-  workflow_dispatch:            # 允许手动触发
+    branches: [ main ]          # 推送到 main 时自动部署
+  workflow_dispatch:            # 也可以手动触发
 
 jobs:
-  build-and-push:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0         # 拉取所有历史，确保可提交
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -21,26 +19,11 @@ jobs:
 
       - name: Install dependencies
         run: npm install
+        working-directory: ./work   # 进入 work 文件夹
 
-      # 可选：执行构建（如打包、压缩等），本例直接复制源码
-      - name: Prepare build output
-        run: |
-          mkdir -p build_tmp
-          cp -r src package.json wrangler.toml schema.sql README.md build_tmp/
-
-      # 将构建产物放到 work 文件夹（替换旧的 work 内容）
-      - name: Update work folder
-        run: |
-          rm -rf work                    # 删除旧的 work 文件夹
-          mkdir work                     # 新建空 work 文件夹
-          cp -r build_tmp/* work/        # 复制构建产物到 work
-          rm -rf build_tmp               # 清理临时目录
-
-      # 提交并推送更改到当前分支
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add work
-          git commit -m "Update work folder from commit ${{ github.sha }}" || echo "No changes to commit"
-          git push origin HEAD           # 推送到当前分支
+      - name: Deploy Worker
+        run: npx wrangler deploy
+        working-directory: ./work   # 在 work 文件夹执行
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
