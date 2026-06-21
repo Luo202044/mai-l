@@ -1,4 +1,4 @@
-name: Build work folder (no deploy)
+name: Build and commit work folder
 
 on:
   push:
@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 需要完整历史以便提交
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -26,11 +28,12 @@ jobs:
           mkdir -p work/src
           cp -r src work/
           cp package.json wrangler.toml work/
-          # 如果你有 schema.sql 或其他文件，可在此添加
-          # cp schema.sql work/
+          # 如果有其他文件，可在此添加
 
-      - name: Upload artifact (the work folder)
-        uses: actions/upload-artifact@v4
-        with:
-          name: work-folder
-          path: work/
+      - name: Commit and push work folder
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add work
+          git commit -m "Update work folder [skip ci]" || echo "No changes to commit"
+          git push origin main
