@@ -1,4 +1,4 @@
-name: Deploy to Cloudflare Workers
+name: Build to Work Directory
 
 on:
   push:
@@ -11,10 +11,10 @@ on:
       - '.github/workflows/deploy.yml'
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout code
@@ -28,8 +28,17 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Deploy to Cloudflare Workers
-        run: npm run deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Copy files to work directory
+        run: |
+          mkdir -p work
+          cp -r src work/
+          cp wrangler.toml work/
+          cp package.json work/
+          cp package-lock.json work/ 2>/dev/null || true
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add work/
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Build: Copy files to work directory" && git push)
