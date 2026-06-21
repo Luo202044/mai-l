@@ -1,0 +1,41 @@
+name: Build and Push to work branch
+
+on:
+  push:
+    branches: [ main ]          # 当 main 更新时触发
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0         # 拉取所有历史，以便后续切换分支
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 如果需要进行构建（如打包），可在此添加，本例直接复制源码
+      - name: Prepare build output
+        run: |
+          mkdir -p dist
+          cp -r src package.json wrangler.toml schema.sql README.md dist/
+
+      - name: Push to work branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan work        # 如果 work 分支不存在则创建
+          # 若 work 已存在，先删除所有文件，再复制新内容
+          git rm -rf . || true
+          cp -r dist/* .
+          git add .
+          git commit -m "Build from main branch commit ${{ github.sha }}"
+          git push -f origin work           # 强制推送（注意：会覆盖 work 分支）
