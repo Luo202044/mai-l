@@ -1,5 +1,6 @@
-import { PostalMime } from 'postal-mime';
+import PostalMime from 'postal-mime';
 
+// ---------- 自动建表 SQL ----------
 const CREATE_TABLES_SQL = `
 CREATE TABLE IF NOT EXISTS mailboxes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
