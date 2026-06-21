@@ -1,0 +1,43 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches:
+      - main  # 当推送到 main 分支时触发，可改为你的默认分支
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci  # 使用 package-lock.json 确保一致性
+
+      - name: Create D1 database tables
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx wrangler d1 execute 2 --file=./schema.sql --yes
+        # 如果数据库表已存在，会忽略 CREATE TABLE 错误（IF NOT EXISTS）
+
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx wrangler deploy --yes
+
+      - name: Set PASSWORD secret for Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          # 将密码通过 wrangler secret put 写入 Worker 环境
+          echo "${{ secrets.PASSWORD }}" | npx wrangler secret put PASSWORD --yes
+        # 注意：如果密码已存在，此命令会更新它；若不存在则创建
