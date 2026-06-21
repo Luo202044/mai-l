@@ -1,4 +1,4 @@
-name: Build and Push to work branch
+name: Build and Push to work folder
 
 on:
   push:
@@ -9,10 +9,10 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout main branch
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0         # 拉取所有历史，以便切换分支
+          fetch-depth: 0         # 拉取所有历史，确保可提交
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -20,21 +20,27 @@ jobs:
           node-version: 18
 
       - name: Install dependencies
-        run: npm install         # 改为 npm install，无需 lock 文件
+        run: npm install
 
-      # 如果需要构建（如打包），可在此添加步骤
+      # 可选：执行构建（如打包、压缩等），本例直接复制源码
       - name: Prepare build output
         run: |
-          mkdir -p dist
-          cp -r src package.json wrangler.toml schema.sql README.md dist/
+          mkdir -p build_tmp
+          cp -r src package.json wrangler.toml schema.sql README.md build_tmp/
 
-      - name: Push to work branch
+      # 将构建产物放到 work 文件夹（替换旧的 work 内容）
+      - name: Update work folder
+        run: |
+          rm -rf work                    # 删除旧的 work 文件夹
+          mkdir work                     # 新建空 work 文件夹
+          cp -r build_tmp/* work/        # 复制构建产物到 work
+          rm -rf build_tmp               # 清理临时目录
+
+      # 提交并推送更改到当前分支
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan work        # 如果 work 分支不存在则创建
-          git rm -rf . || true
-          cp -r dist/* .
-          git add .
-          git commit -m "Build from main branch commit ${{ github.sha }}"
-          git push -f origin work           # 强制推送
+          git add work
+          git commit -m "Update work folder from commit ${{ github.sha }}" || echo "No changes to commit"
+          git push origin HEAD           # 推送到当前分支
