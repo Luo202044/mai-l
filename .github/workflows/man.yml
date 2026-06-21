@@ -1,12 +1,12 @@
-name: Deploy to Cloudflare Workers
+name: Build work folder (no deploy)
 
 on:
   push:
-    branches: [ main ]          # 推送到 main 时自动部署
-  workflow_dispatch:            # 也可以手动触发
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -19,11 +19,18 @@ jobs:
 
       - name: Install dependencies
         run: npm install
-        working-directory: ./work   # 进入 work 文件夹
 
-      - name: Deploy Worker
-        run: npx wrangler deploy
-        working-directory: ./work   # 在 work 文件夹执行
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Prepare deployment files (work folder)
+        run: |
+          rm -rf work
+          mkdir -p work/src
+          cp -r src work/
+          cp package.json wrangler.toml work/
+          # 如果你有 schema.sql 或其他文件，可在此添加
+          # cp schema.sql work/
+
+      - name: Upload artifact (the work folder)
+        uses: actions/upload-artifact@v4
+        with:
+          name: work-folder
+          path: work/
