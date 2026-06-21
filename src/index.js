@@ -1,6 +1,5 @@
 import PostalMime from 'postal-mime';
 
-// ---------- 自动建表 SQL ----------
 const CREATE_TABLES_SQL = `
 CREATE TABLE IF NOT EXISTS mailboxes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,7 +72,7 @@ export default {
         ).all();
         return new Response(generateListPage(messages.results), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       } catch (error) {
-        return new Response('加载邮件列表失败', { status: 500 });
+        return new Response('加载邮件列表失败: ' + error.message, { status: 500 });
       }
     }
     if (path.startsWith('/view/')) {
@@ -88,7 +87,7 @@ export default {
         await env.DB.prepare('UPDATE messages SET is_read = 1 WHERE id = ?').bind(messageId).run();
         return new Response(generateDetailPage(message), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       } catch (error) {
-        return new Response('加载邮件详情失败', { status: 500 });
+        return new Response('加载邮件详情失败: ' + error.message, { status: 500 });
       }
     }
     if (path === '/logout') {
@@ -125,6 +124,7 @@ function generateListPage(messages) {
   <table><thead><tr><th>收件人</th><th>发件人</th><th>主题</th><th>接收时间</th><th>状态</th></tr></thead>
   <tbody>${rows || '<tr><td colspan="5">暂无邮件</td></tr>'}</tbody></table></body></html>`;
 }
+
 function generateDetailPage(message) {
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>📄 ${escapeHtml(message.subject)}</title>
   <style>body{font-family:sans-serif;max-width:800px;margin:20px auto;padding:0 20px;}
@@ -136,4 +136,8 @@ function generateDetailPage(message) {
   <p><strong>接收时间:</strong> ${new Date(message.received_at).toLocaleString()}</p></div>
   <div class="email-content">${message.html_content ? message.html_content : escapeHtml(message.content || '(无内容)')}</div></body></html>`;
 }
-function escapeHtml(unsafe) { if (!unsafe) return ''; return unsafe.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;'); }
+
+function escapeHtml(unsafe) {
+  if (!unsafe) return '';
+  return unsafe.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+}
