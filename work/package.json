@@ -1,0 +1,16 @@
+{
+  "name": "mail-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for receiving emails and web interface",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "postal-mime": "^2.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
