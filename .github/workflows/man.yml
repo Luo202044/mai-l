@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# 显式授予写入权限（如果全局设置已开启，此段可省略）
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -12,7 +16,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # 需要完整历史以便提交
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -28,7 +32,6 @@ jobs:
           mkdir -p work/src
           cp -r src work/
           cp package.json wrangler.toml work/
-          # 如果有其他文件，可在此添加
 
       - name: Commit and push work folder
         run: |
