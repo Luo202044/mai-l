@@ -24,6 +24,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at);
 let tablesReady = false;
 
 export default {
+  // 1. 接收邮件入口
   async email(message, env, ctx) {
     await ensureTables(env);
     const toAddress = message.to;
@@ -47,63 +48,102 @@ export default {
     }
   },
 
+  // 2. Web 后台管理入口
   async fetch(request, env, ctx) {
     await ensureTables(env);
     const url = new URL(request.url);
     const path = url.pathname;
-    const PASSWORD = env.PASSWORD || 'admin123';
+    
+    // 实时读取最新的配置（支持免重启重新加载）
+    const PASSWORD_RAW = env.PASSWORD || 'admin123';
     const SECRET_KEY = env.SECRET_KEY || 'your-secret-key-change-me';
 
-    // 生成会话令牌
-    const generateToken = async (password) => {
+    // 动态解析多密码列表（过滤空格和空字符串）
+    const getPasswordList = () => {
+      return PASSWORD_RAW.split(',').map(p => p.trim()).filter(Boolean);
+    };
+
+    // 辅助函数：计算单密码的摘要值，用于 Token 隔离
+    const getPwdHash = async (pwd) => {
       const encoder = new TextEncoder();
-      const data = encoder.encode(`${password}:${Date.now()}:${SECRET_KEY}`);
+      const data = encoder.encode(pwd);
       const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
     };
 
-    // 检查认证 Cookie
-    const checkAuth = (req) => {
+    // 基于 HMAC-SHA256 的安全 Token 生成（绑定特定密码哈希）
+    const generateToken = async (timestamp, pwdHash) => {
+      const encoder = new TextEncoder();
+      const secretKeyData = encoder.encode(SECRET_KEY);
+      const key = await crypto.subtle.importKey(
+        'raw', secretKeyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+      );
+      const messageData = encoder.encode(`${timestamp}:${pwdHash}`);
+      const mac = await crypto.subtle.sign('HMAC', key, messageData);
+      const hashArray = Array.from(new Uint8Array(mac));
+      const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      return `${timestamp}.${pwdHash}.${hash}`;
+    };
+
+    // 严格的 Token 校验（校验时实时比对当前的有效密码列表）
+    const checkAuth = async (req) => {
       const cookies = parseCookies(req.headers.get('Cookie') || '');
-      return cookies.auth_token ? true : false;
+      if (!cookies.auth_token) return false;
+      
+      const parts = cookies.auth_token.split('.');
+      if (parts.length !== 3) return false;
+      
+      const [timestampStr, tokenPwdHash, hash] = parts;
+      const timestamp = parseInt(timestampStr, 10);
+      
+      // 1. 检查 Token 是否过期（有效期 24 小时）
+      if (isNaN(timestamp) || Date.now() - timestamp > 86400000) return false;
+      
+      // 2. 重新计算签名，验证 Token 是否被篡改
+      const expectedToken = await generateToken(timestamp, tokenPwdHash);
+      if (cookies.auth_token !== expectedToken) return false;
+
+      // 3. 动态配置重载核心：验证当前 Token 里的密码哈希，是否依然存在于最新的密码列表中
+      const currentPasswords = getPasswordList();
+      const validHashes = await Promise.all(currentPasswords.map(p => getPwdHash(p)));
+      
+      return validHashes.includes(tokenPwdHash);
     };
 
-    // 解析 Cookie
     const parseCookies = (cookieHeader) => {
       const cookies = {};
       if (cookieHeader) {
         cookieHeader.split(';').forEach(cookie => {
           const [name, value] = cookie.trim().split('=');
-          if (name && value) {
-            cookies[name] = decodeURIComponent(value);
-          }
+          if (name && value) cookies[name] = decodeURIComponent(value);
         });
       }
       return cookies;
     };
 
-    // 登录页面
+    // 路由: 登录页
     if (path === '/login' && request.method === 'GET') {
       return new Response(generateLoginPage(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    // 处理登录提交
+    // 路由: 登录提交
     if (path === '/login' && request.method === 'POST') {
       try {
         const formData = await request.formData();
-        const password = formData.get('password');
+        const inputPassword = formData.get('password') || '';
+        const currentPasswords = getPasswordList();
         
-        if (password === PASSWORD) {
-          const token = await generateToken(password);
-          const response = new Response(null, {
+        // 匹配任意一个有效密码
+        if (currentPasswords.includes(inputPassword)) {
+          const pwdHash = await getPwdHash(inputPassword);
+          const token = await generateToken(Date.now(), pwdHash);
+          return new Response(null, {
             status: 302,
             headers: {
               'Location': '/',
-              'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`
+              'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400`
             }
           });
-          return response;
         } else {
           return new Response(generateLoginPage('密码错误，请重试'), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         }
@@ -112,13 +152,10 @@ export default {
       }
     }
 
-    // 邮件列表
+    // 路由: 邮件列表 (需要鉴权)
     if (path === '/' || path === '') {
-      if (!checkAuth(request)) {
-        return new Response(null, {
-          status: 302,
-          headers: { 'Location': '/login' }
-        });
+      if (!(await checkAuth(request))) {
+        return new Response(null, { status: 302, headers: { 'Location': '/login' } });
       }
       try {
         const messages = await env.DB.prepare(
@@ -130,13 +167,10 @@ export default {
       }
     }
 
-    // 查看邮件详情
+    // 路由: 查看邮件详情 (需要鉴权)
     if (path.startsWith('/view/')) {
-      if (!checkAuth(request)) {
-        return new Response(null, {
-          status: 302,
-          headers: { 'Location': '/login' }
-        });
+      if (!(await checkAuth(request))) {
+        return new Response(null, { status: 302, headers: { 'Location': '/login' } });
       }
       const messageId = path.split('/')[2];
       if (!messageId) return new Response('缺少邮件ID', { status: 400 });
@@ -152,13 +186,28 @@ export default {
       }
     }
 
-    // 删除邮件
-    if (path.startsWith('/delete/') && request.method === 'POST') {
-      if (!checkAuth(request)) {
-        return new Response(null, {
-          status: 302,
-          headers: { 'Location': '/login' }
-        });
+    // 路由: 渲染 HTML 邮件原始内容 (专门供给 iframe 的安全沙箱)
+    if (path.startsWith('/raw-html/')) {
+      if (!(await checkAuth(request))) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      const messageId = path.split('/')[2];
+      const message = await env.DB.prepare('SELECT html_content, content FROM messages WHERE id = ?').bind(messageId).first();
+      if (!message) return new Response('Not Found', { status: 404 });
+      
+      const body = message.html_content || `<pre style="white-space: pre-wrap; font-family: monospace;">${escapeHtml(message.content)}</pre>`;
+      return new Response(body, {
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Security-Policy': "default-src 'self' http: https: data: 'unsafe-inline'; script-src 'none'; object-src 'none';" 
+        }
+      });
+    }
+
+    // 路由: 删除邮件 (需要鉴权)
+    if (path.startsWith('/delete/')) {
+      if (!(await checkAuth(request))) {
+        return new Response(null, { status: 302, headers: { 'Location': '/login' } });
       }
       const messageId = path.split('/')[2];
       if (!messageId) return new Response('缺少邮件ID', { status: 400 });
@@ -170,13 +219,13 @@ export default {
       }
     }
 
-    // 登出
+    // 路由: 登出
     if (path === '/logout') {
       return new Response(null, {
         status: 302,
         headers: {
           'Location': '/login',
-          'Set-Cookie': 'auth_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0'
+          'Set-Cookie': 'auth_token=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0'
         }
       });
     }
@@ -190,356 +239,27 @@ async function ensureTables(env) {
   try {
     await env.DB.exec(CREATE_TABLES_SQL);
     tablesReady = true;
-    console.log('✅ 数据库表已自动创建');
+    console.log('✅ 数据库表验证成功');
   } catch (err) {
     console.error('❌ 自动建表失败:', err);
   }
 }
 
-function generateLoginPage(errorMessage = '') {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>📧 邮件收件箱 - 登录</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      padding: 20px;
-    }
-    .login-container {
-      background: white;
-      border-radius: 10px;
-      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-      width: 100%;
-      max-width: 400px;
-      padding: 40px;
-    }
-    .login-header {
-      text-align: center;
-      margin-bottom: 30px;
-    }
-    .login-header h1 {
-      font-size: 32px;
-      margin-bottom: 10px;
-    }
-    .login-header p {
-      color: #666;
-      font-size: 14px;
-    }
-    .form-group {
-      margin-bottom: 20px;
-    }
-    .form-group label {
-      display: block;
-      margin-bottom: 8px;
-      color: #333;
-      font-weight: 500;
-      font-size: 14px;
-    }
-    .form-group input {
-      width: 100%;
-      padding: 12px;
-      border: 1px solid #ddd;
-      border-radius: 5px;
-      font-size: 14px;
-      transition: border-color 0.3s;
-    }
-    .form-group input:focus {
-      outline: none;
-      border-color: #667eea;
-      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-    }
-    .submit-btn {
-      width: 100%;
-      padding: 12px;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      border: none;
-      border-radius: 5px;
-      font-size: 16px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: transform 0.2s, box-shadow 0.2s;
-    }
-    .submit-btn:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
-    }
-    .submit-btn:active {
-      transform: translateY(0);
-    }
-    .error-message {
-      color: #dc3545;
-      font-size: 14px;
-      margin-bottom: 20px;
-      padding: 10px;
-      background-color: #f8d7da;
-      border: 1px solid #f5c6cb;
-      border-radius: 5px;
-      display: ${errorMessage ? 'block' : 'none'};
-    }
-  </style>
-  </head>
-  <body>
-    <div class="login-container">
-      <div class="login-header">
-        <h1>📧</h1>
-        <h2>邮件收件箱</h2>
-        <p>请输入密码登录</p>
-      </div>
-      <form method="POST" action="/login">
-        ${errorMessage ? `<div class="error-message">${escapeHtml(errorMessage)}</div>` : ''}
-        <div class="form-group">
-          <label for="password">密码</label>
-          <input type="password" id="password" name="password" required autofocus placeholder="输入密码">
-        </div>
-        <button type="submit" class="submit-btn">登录</button>
-      </form>
-    </div>
-  </body>
-  </html>`;
-}
-
-function generateListPage(messages) {
-  const rows = messages.map(msg => `
-    <tr>
-      <td>${escapeHtml(msg.mailbox_email)}</td>
-      <td>${escapeHtml(msg.from_address)}</td>
-      <td><a href="/view/${msg.id}">${escapeHtml(msg.subject)}</a></td>
-      <td>${new Date(msg.received_at).toLocaleString()}</td>
-      <td>${msg.is_read ? '已读' : '未读'}</td>
-      <td><button class="delete-btn" onclick="deleteEmail(${msg.id})">删除</button></td>
-    </tr>
-  `).join('');
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>📧 邮件收件箱</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background-color: #f5f5f5;
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 20px;
-    }
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 30px;
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-    }
-    .header h1 {
-      font-size: 24px;
-      margin: 0;
-    }
-    .logout-btn {
-      padding: 10px 20px;
-      background: #dc3545;
-      color: white;
-      text-decoration: none;
-      border-radius: 5px;
-      font-weight: 600;
-      transition: background 0.3s;
-    }
-    .logout-btn:hover {
-      background: #c82333;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      background: white;
-      border-radius: 8px;
-      overflow: hidden;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-    }
-    th {
-      background: #f8f9fa;
-      padding: 15px;
-      text-align: left;
-      font-weight: 600;
-      border-bottom: 2px solid #e9ecef;
-    }
-    td {
-      padding: 15px;
-      border-bottom: 1px solid #e9ecef;
-    }
-    tr:last-child td {
-      border-bottom: none;
-    }
-    a {
-      color: #667eea;
-      text-decoration: none;
-    }
-    a:hover {
-      text-decoration: underline;
-    }
-    .delete-btn {
-      padding: 6px 12px;
-      background: #ff6b6b;
-      color: white;
-      border: none;
-      border-radius: 3px;
-      cursor: pointer;
-      font-size: 12px;
-      transition: background 0.3s;
-    }
-    .delete-btn:hover {
-      background: #ee5a52;
-    }
-    .empty-message {
-      text-align: center;
-      padding: 40px;
-      color: #999;
-    }
-  </style>
-  <script>
-    function deleteEmail(id) {
-      if (confirm('确定要删除该邮件吗？')) {
-        fetch('/delete/' + id, { method: 'POST' }).then(() => location.reload());
-      }
-    }
-  </script>
-  </head>
-  <body>
-    <div class="header">
-      <h1>📬 邮件收件箱 (${messages.length} 封)</h1>
-      <a href="/logout" class="logout-btn">退出登录</a>
-    </div>
-    <table>
-      <thead>
-        <tr>
-          <th>收件人</th>
-          <th>发件人</th>
-          <th>主题</th>
-          <th>接收时间</th>
-          <th>状态</th>
-          <th>操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows ? rows : '<tr><td colspan="6" class="empty-message">暂无邮件</td></tr>'}
-      </tbody>
-    </table>
-  </body>
-  </html>`;
-}
-
-function generateDetailPage(message) {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>📄 ${escapeHtml(message.subject)}</title>
-  <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background-color: #f5f5f5;
-      max-width: 800px;
-      margin: 0 auto;
-      padding: 20px;
-    }
-    .back-link {
-      display: inline-block;
-      margin-bottom: 20px;
-      color: #667eea;
-      text-decoration: none;
-      font-weight: 600;
-    }
-    .back-link:hover {
-      text-decoration: underline;
-    }
-    h1 {
-      margin-bottom: 20px;
-      color: #333;
-    }
-    .email-meta {
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      margin-bottom: 20px;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-    }
-    .email-meta p {
-      margin-bottom: 10px;
-      color: #555;
-    }
-    .email-meta strong {
-      color: #333;
-    }
-    .email-content {
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      margin-bottom: 20px;
-      white-space: pre-wrap;
-      word-wrap: break-word;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-      line-height: 1.6;
-    }
-    .email-content img {
-      max-width: 100%;
-      height: auto;
-    }
-    .actions {
-      display: flex;
-      gap: 10px;
-    }
-    .delete-btn {
-      padding: 12px 20px;
-      background: #dc3545;
-      color: white;
-      border: none;
-      border-radius: 5px;
-      cursor: pointer;
-      font-weight: 600;
-      transition: background 0.3s;
-    }
-    .delete-btn:hover {
-      background: #c82333;
-    }
-  </style>
-  <script>
-    function deleteAndGoBack() {
-      if (confirm('确定要删除该邮件吗？')) {
-        fetch('/delete/${message.id}', { method: 'POST' }).then(() => {
-          window.location.href = '/';
-        });
-      }
-    }
-  </script>
-  </head>
-  <body>
-    <a href="/" class="back-link">← 返回收件箱</a>
-    <h1>${escapeHtml(message.subject)}</h1>
-    <div class="email-meta">
-      <p><strong>发件人:</strong> ${escapeHtml(message.from_address)}</p>
-      <p><strong>收件人:</strong> ${escapeHtml(message.mailbox_email)}</p>
-      <p><strong>接收时间:</strong> ${new Date(message.received_at).toLocaleString()}</p>
-    </div>
-    <div class="email-content">${message.html_content ? message.html_content : escapeHtml(message.content || '(无内容)')}</div>
-    <div class="actions">
-      <button class="delete-btn" onclick="deleteAndGoBack()">🗑️ 删除邮件</button>
-    </div>
-  </body>
-  </html>`;
-}
-
+// --- 以下为 HTML 模板函数 (保持不变) ---
 function escapeHtml(unsafe) {
   if (!unsafe) return '';
   return unsafe.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+}
+
+function generateLoginPage(errorMessage = '') {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>📧 邮件收件箱 - 登录</title><style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px;color:#f8fafc;}.login-container{background:#1e293b;border:1px solid #334155;border-radius:12px;box-shadow:0 10px 25px -5px rgba(0,0,0,0.3);width:100%;max-width:400px;padding:40px;}.login-header{text-align:center;margin-bottom:30px;}.login-header h2{font-size:24px;margin-top:10px;color:#f1f5f9;}.login-header p{color:#94a3b8;font-size:14px;margin-top:5px;}.form-group{margin-bottom:20px;}.form-group label{display:block;margin-bottom:8px;color:#cbd5e1;font-weight:500;font-size:14px;}.form-group input{width:100%;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:6px;font-size:14px;color:#fff;transition:border-color 0.3s;}.form-group input:focus{outline:none;border-color:#3b82f6;}.submit-btn{width:100%;padding:12px;background:#3b82f6;color:white;border:none;border-radius:6px;font-size:16px;font-weight:600;cursor:pointer;transition:background 0.2s;}.submit-btn:hover{background:#2563eb;}.error-message{color:#ef4444;font-size:14px;margin-bottom:20px;padding:10px;background-color:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:6px;}</style></head><body><div class="login-container"><div class="login-header><h1>📧</h1><h2>邮件收件箱</h2><p>请输入密码以继续</p></div><form method="POST" action="/login">${errorMessage?`<div class="error-message">${escapeHtml(errorMessage)}</div>`:''}<div class="form-group"><label for="password">安全密码</label><input type="password" id="password" name="password" required autofocus placeholder="••••••••"></div><button type="submit" class="submit-btn">验证登录</button></form></div></body></html>`;
+}
+
+function generateListPage(messages) {
+  const rows = messages.map(msg => `<tr class="${msg.is_read ? 'read' : 'unread'}"><td style="font-weight: 500; color:#334155;">${escapeHtml(msg.mailbox_email)}</td><td>${escapeHtml(msg.from_address)}</td><td><a class="subject-link" href="/view/${msg.id}">${escapeHtml(msg.subject || '(无主题)')}</a></td><td class="time-col">${new Date(msg.received_at).toLocaleString('zh-CN', {hour12:false})}</td><td><span class="badge ${msg.is_read ? 'badge-read' : 'badge-unread'}">${msg.is_read ? '已读' : '未读'}</span></td><td><button class="delete-btn" onclick="deleteEmail(${msg.id}, event)">删除</button></td></tr>`).join('');
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>📧 收件箱</title><style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background-color:#f8fafc;color:#1e293b;padding:30px 20px;}.container{max-width:1200px;margin:0 auto;}.header{display:flex;justify-content:between;align-items:center;margin-bottom:24px;background:white;padding:20px 24px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.05);}.header h1{font-size:20px;font-weight:700;color:#0f172a;}.logout-btn{padding:8px 16px;background:#f1f5f9;color:#64748b;text-decoration:none;border-radius:6px;font-size:14px;font-weight:500;transition:all 0.2s;}.logout-btn:hover{background:#e2e8f0;color:#0f172a;}.table-wrapper{background:white;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.05);overflow:hidden;}table{width:100%;border-collapse:collapse;text-align:left;font-size:14px;}th{background:#f8fafc;padding:16px;font-weight:600;color:#64748b;border-bottom:1px solid #e2e8f0;}td{padding:16px;border-bottom:1px solid #f1f5f9;color:#334155;}tr:hover{background-color:#f8fafc;}tr.unread{background-color:#f0fdf4;}tr.unread:hover{background-color:#dcfce7;}.subject-link{color:#2563eb;text-decoration:none;font-weight:500;}.subject-link:hover{text-decoration:underline;}.badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:500;}.badge-unread{background:#dcfce7;color:#166534;}.badge-read{background:#f1f5f9;color:#64748b;}.delete-btn{padding:6px 12px;background:#fff;color:#ef4444;border:1px solid #fee2e2;border-radius:6px;cursor:pointer;transition:all 0.2s;}.delete-btn:hover{background:#ef4444;color:#fff;}.empty{text-align:center;padding:60px;color:#94a3b8;font-size:16px;}.time-col{color:#64748b;font-variant-numeric:tabular-nums;}</style><script>function deleteEmail(id,e){e.preventDefault();if(confirm('确定要彻底删除该邮件吗？')){fetch('/delete/'+id,{method:'POST'}).then(()=>location.reload());}}</script></head><body><div class="container"><div class="header"><h1>📬 临时收件箱 (${messages.length})</h1><a href="/logout" class="logout-btn">安全退出</a></div><div class="table-wrapper"><table><thead><tr><th>别名收件箱</th><th>发件人</th><th>邮件主题</th><th>到达时间</th><th>状态</th><th>管理</th></tr></thead><tbody>${rows?rows:'<tr><td colspan="6" class="empty">📭 暂无任何邮件。</td></tr>'}</tbody></table></div></div></body></html>`;
+}
+
+function generateDetailPage(message) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${escapeHtml(message.subject || '查看邮件')}</title><style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background-color:#f8fafc;color:#1e293b;padding:30px 20px;}.container{max-width:900px;margin:0 auto;}.back-btn{display:inline-flex;align-items:center;padding:8px 14px;background:white;border:1px solid #e2e8f0;border-radius:6px;color:#475569;text-decoration:none;font-size:14px;margin-bottom:20px;box-shadow:0 1px 2px rgba(0,0,0,0.05);}.back-btn:hover{background:#f8fafc;color:#0f172a;}.card{background:white;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.05);padding:30px;margin-bottom:20px;}.subject{font-size:22px;font-weight:700;color:#0f172a;margin-bottom:20px;line-height:1.4;}.meta-grid{display:grid;grid-template-columns:auto 1fr;gap:10px 16px;font-size:14px;border-bottom:1px solid #f1f5f9;padding-bottom:20px;margin-bottom:20px;}.meta-label{color:#64748b;font-weight:500;}.meta-value{color:#334155;}.iframe-container{width:100%;border:1px solid #e2e8f0;border-radius:8px;background:#fff;overflow:hidden;margin-top:10px;}iframe{width:100%;min-height:500px;border:none;display:block;}.danger-zone{display:flex;justify-content:flex-end;}.delete-btn{padding:10px 20px;background:#fee2e2;color:#ef4444;border:1px solid #fca5a5;border-radius:6px;cursor:pointer;font-weight:600;font-size:14px;transition:all 0.2s;}.delete-btn:hover {background:#ef4444;color:white;}</style><script>function deleteAndGoBack(){if(confirm('确定要删除该邮件并返回收件箱吗？')){fetch('/delete/${message.id}',{method:'POST'}).then(()=>{window.location.href='/';});}}function resizeIframe(obj){setTimeout(()=>{try{obj.style.height=obj.contentWindow.document.documentElement.scrollHeight+40+'px';}catch(e){obj.style.height='600px';}},200);}</script></head><body><div class="container"><a href="/" class="back-btn">← 返回收件箱</a><div class="card"><div class="subject">${escapeHtml(message.subject||'(无主题)')}</div><div class="meta-grid"><div class="meta-label">发件人</div><div class="meta-value">${escapeHtml(message.from_address)}</div><div class="meta-label">收件别名</div><div class="meta-value">${escapeHtml(message.mailbox_email)}</div><div class="meta-label">时间</div><div class="meta-value">${new Date(message.received_at).toLocaleString()}</div></div><div class="iframe-container"><iframe src="/raw-html/${message.id}" sandbox="allow-popups allow-popups-to-escape-sandbox" onload="resizeIframe(this)"></iframe></div></div><div class="danger-zone"><button class="delete-btn" onclick="deleteAndGoBack()">🗑️ 彻底删除邮件</button></div></div></body></html>`;
 }
