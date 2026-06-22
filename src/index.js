@@ -78,7 +78,7 @@ export default {
     if (!toAddress) return;
 
     try {
-      // 检查系统设置中的接收域名白名单限制 [cite: 15]
+      // 检查系统设置中的接收域名白名单限制
       const config = await getSystemConfig(env);
       if (config.allowed_domains && config.allowed_domains.length > 0) {
         const domain = toAddress.split('@')[1];
@@ -115,7 +115,7 @@ export default {
     const clientIp = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
     const userAgent = request.headers.get('User-Agent') || '';
 
-    // 从环境变量中读取基础凭证 
+    // 从环境变量中读取基础凭证
     const SUPER_USER = env.SUPER_USERNAME || 'superuser';
     const SUPER_PASS = env.SUPER_PASSWORD || 'superpassword123';
     const JWT_SECRET = env.JWT_SECRET || 'a-very-secret-string-more-than-32-chars';
@@ -170,14 +170,14 @@ export default {
         
         if (!valid) return null;
         const payload = JSON.parse(base64UrlDecode(encodedPayload));
-        if (Date.now() > payload.exp) return null; // 令牌过期 
+        if (Date.now() > payload.exp) return null; 
         return payload;
       } catch (e) {
         return null;
       }
     };
 
-    // 🛡️ 鉴权中间件逻辑 
+    // 🛡️ 鉴权中间件逻辑
     const getSession = async () => {
       const cookies = parseCookies(request.headers.get('Cookie') || '');
       if (!cookies.auth_token) return null;
@@ -185,24 +185,21 @@ export default {
       const payload = await verifyJWT(cookies.auth_token);
       if (!payload) return null;
 
-      // 如果是超管身份，直接放行 
       if (payload.user_id === 0) return payload;
 
-      // 如果是普通用户/管理员，从 D1 实时进行校验 
       const dbUser = await env.DB.prepare('SELECT token_version, disabled, permissions, accessible_emails FROM users WHERE id = ?')
         .bind(payload.user_id).first();
       
       if (!dbUser || dbUser.disabled === 1 || dbUser.token_version !== payload.token_version) {
-        return null; // 强制下线 
+        return null; 
       }
 
-      // 将最新数据库里的权限同步附加
       payload.permissions = JSON.parse(dbUser.permissions);
       payload.accessible_emails = JSON.parse(dbUser.accessible_emails);
       return payload;
     };
 
-    // 🏗️ 审计日志异步记录辅助器 [cite: 29]
+    // 🏗️ 审计日志辅助器
     const logAction = (userId, username, action, targetType, targetId, description, success) => {
       ctx.waitUntil((async () => {
         try {
@@ -217,10 +214,10 @@ export default {
     };
 
     // ------------------------------------------
-    // ⚙️ 路由流控制
+    // ⚙️ 路由处理
     // ------------------------------------------
     
-    // API: 登录提交 
+    // API: 登录提交
     if (path === '/api/login' && request.method === 'POST') {
       try {
         const formData = await request.formData();
@@ -229,7 +226,6 @@ export default {
         const config = await getSystemConfig(env);
         const expiryHours = config.session_expiry_hours || 24;
 
-        // 1. 验证是否匹配超管 
         if (username === SUPER_USER && password === SUPER_PASS) {
           const jwt = await generateJWT({
             user_id: 0,
@@ -245,7 +241,6 @@ export default {
           });
         }
 
-        // 2. 验证常规数据库用户 
         const user = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
         if (user) {
           if (user.disabled === 1) {
@@ -276,12 +271,12 @@ export default {
       }
     }
 
-    // 页面: 登录页渲染 
+    // 页面: 登录页
     if (path === '/login' && request.method === 'GET') {
       return new Response(generateLoginPage(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    // 🚪 退出登录 
+    // 🚪 退出登录
     if (path === '/logout') {
       const session = await getSession();
       if (session) logAction(session.user_id, session.username, 'logout', 'user', session.user_id, '注销退出登录', true);
@@ -292,7 +287,7 @@ export default {
     }
 
     // ==========================================
-    // 🛡️ 以下路由均需通过 JWT 认证中间件
+    // 🛡️ 后续路由 JWT 鉴权拦截
     // ==========================================
     const session = await getSession();
     if (!session) {
@@ -301,23 +296,20 @@ export default {
 
     const hasPermission = (perm) => session.role === 'superuser' || session.permissions.includes(perm);
 
-    // 🏠 路由: 邮件接收主列表首页 
+    // 🏠 路由: 邮件接收主列表页
     if (path === '/' || path === '') {
       try {
         let querySql = `SELECT m.*, mb.email as mailbox_email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id`;
         let bindParams = [];
 
-        // 🔐 精准的邮件数据可见性控制过滤 [cite: 2, 3]
         if (session.role !== 'superuser' && !hasPermission('mail:view:all')) {
           let conditions = [];
           
-          // 关联自有的邮箱专属控制 [cite: 9]
           if (hasPermission('mail:view:own') && session.email) {
             conditions.push(`mb.email = ?`);
             bindParams.push(session.email);
           }
           
-          // 可访问名单级联控制 [cite: 2, 3]
           if (hasPermission('mail:view:allowed') && session.accessible_emails) {
             session.accessible_emails.forEach(allowed => {
               if (allowed.startsWith('@')) {
@@ -347,7 +339,7 @@ export default {
       }
     }
 
-    // 📄 路由: 详情查看页 
+    // 📄 路由: 详情查看页
     if (path.startsWith('/view/')) {
       const messageId = path.split('/')[2];
       try {
@@ -357,7 +349,6 @@ export default {
 
         if (!message) return new Response('邮件不存在', { status: 404 });
 
-        // 校验邮件查看控制范畴 [cite: 2, 3]
         if (!checkMailAccess(session, message.mailbox_email, 'view')) {
           logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权查看邮件拦截: ${message.mailbox_email}`, false);
           return new Response('无权查看该邮件', { status: 403 });
@@ -371,7 +362,7 @@ export default {
       }
     }
 
-    // 🛡️ 路由: 沙箱隔离富文本渲染内联入口 
+    // 🛡️ 路由: 沙箱隔离内联渲染流
     if (path.startsWith('/raw-html/')) {
       const messageId = path.split('/')[2];
       const message = await env.DB.prepare('SELECT m.html_content, m.content, mb.email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?').bind(messageId).first();
@@ -388,16 +379,15 @@ export default {
       });
     }
 
-    // 🗑️ 路由: 邮件删除接口 
+    // 🗑️ 路由: 邮件删除
     if (path.startsWith('/delete/') && request.method === 'POST') {
       const messageId = path.split('/')[2];
       try {
         const message = await env.DB.prepare('SELECT mb.email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?').bind(messageId).first();
         if (!message) return new Response('邮件未找到', { status: 404 });
 
-        // 级联检验删除权限与范围 [cite: 3, 4]
         if (!checkMailAccess(session, message.email, 'delete')) {
-          logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权执行删除邮件拦截: ${message.email}`, false);
+          logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权删除邮件拦截: ${message.email}`, false);
           return new Response('无操作权限', { status: 403 });
         }
 
@@ -409,7 +399,7 @@ export default {
       }
     }
 
-    // 👥 路由: 用户集中配置管理后台 (仅限具备 user:manage 权限的主体) 
+    // 👥 路由: 用户授权中心面板
     if (path === '/admin/users') {
       if (!hasPermission('user:manage:restricted') && !hasPermission('user:manage:all')) {
         return new Response('无权访问管理面板', { status: 403 });
@@ -420,15 +410,13 @@ export default {
         return new Response(generateUserPage(users.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       }
 
-      // 处理异步新增/编辑提交
       if (request.method === 'POST') {
         try {
           const body = await request.json();
           const { action, id, username, password, email, role, permissions, accessible_emails, disabled } = body;
 
-          // 级联权限隔离：受限管理员只能创建普通用户 [cite: 4, 5]
           if (!hasPermission('user:manage:all') && role === 'admin') {
-            return new Response(JSON.stringify({ success: false, message: '您无权创建或提权管理员账户' }), { status: 403 });
+            return new Response(JSON.stringify({ success: false, message: '您无权管理管理员账户' }), { status: 403 });
           }
 
           if (action === 'create') {
@@ -442,8 +430,7 @@ export default {
           }
 
           if (action === 'update') {
-            // 保护机制：不允许非全权管理员篡改已存在的高管 [cite: 4, 5]
-            const target = await env.DB.prepare('SELECT role, token_version FROM users WHERE id = ?').bind(id).first();
+            const target = await env.DB.prepare('SELECT role FROM users WHERE id = ?').bind(id).first();
             if (target.role === 'admin' && !hasPermission('user:manage:all')) {
               return new Response(JSON.stringify({ success: false, message: '权限不足，无法编辑管理员角色' }), { status: 403 });
             }
@@ -461,12 +448,12 @@ export default {
             params.push(id);
 
             await env.DB.prepare(updateSql).bind(...params).run();
-            logAction(session.user_id, session.username, 'update_user', 'user', id, `编辑并更新了用户账户: ${username}，强制增加其令牌版本`, true);
+            logAction(session.user_id, session.username, 'update_user', 'user', id, `编辑并更新了用户账户: ${username}`, true);
             return new Response(JSON.stringify({ success: true }));
           }
 
           if (action === 'delete') {
-            if (!hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '只有超级管理员或全权管理员有权注销账户' }), { status: 403 });
+            if (!hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '权限不足' }), { status: 403 });
             await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
             logAction(session.user_id, session.username, 'delete_user', 'user', id, `删除了用户 ID: ${id}`, true);
             return new Response(JSON.stringify({ success: true }));
@@ -477,13 +464,13 @@ export default {
       }
     }
 
-    // 📋 路由: 集中审计日志面板 
+    // 📋 路由: 审计日志面板
     if (path === '/admin/logs' && hasPermission('log:view:all')) {
       const logs = await env.DB.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200').all();
       return new Response(generateLogPage(logs.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    // ⚙️ 路由: 全局配置面板页面 
+    // ⚙️ 路由: 系统控制策略配置
     if (path === '/admin/settings' && hasPermission('system:config:view')) {
       if (request.method === 'GET') {
         const config = await getSystemConfig(env);
@@ -493,16 +480,13 @@ export default {
       if (request.method === 'POST' && hasPermission('system:config:edit')) {
         try {
           const body = await request.json();
-          // 更新 allowed_domains [cite: 15]
           await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
             .bind('allowed_domains', JSON.stringify(body.allowed_domains || []), session.user_id).run();
-          // 更新 session_expiry_hours [cite: 15]
           await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
             .bind('session_expiry_hours', JSON.stringify(parseInt(body.session_expiry_hours, 10) || 24), session.user_id).run();
 
-          // 主动使当前的全局变量缓存失效，完成热重载更新 
           configCache = null; 
-          logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '重新调整了全局核心控制设置策略并完成了热重载', true);
+          logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '调整了全局核心控制设置策略并完成了重载', true);
           return new Response(JSON.stringify({ success: true }));
         } catch (e) {
           return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
@@ -515,10 +499,9 @@ export default {
 };
 
 // ==========================================
-// 3. 核心策略校验与缓存机制辅助函数
+// 3. 策略校验与热重载缓存辅助函数
 // ==========================================
 
-// 精准核对当前用户是否被允许操作某一邮件 [cite: 3, 4]
 function checkMailAccess(session, targetEmail, type) {
   if (session.role === 'superuser' || session.permissions.includes(`mail:${type}:all`)) return true;
   if (session.permissions.includes(`mail:${type}:own`) && session.email === targetEmail) return true;
@@ -532,11 +515,10 @@ function checkMailAccess(session, targetEmail, type) {
   return false;
 }
 
-// 动态免重启配置热重载获取方法 
 async function getSystemConfig(env) {
   const now = Date.now();
   if (configCache && (now - cacheTimestamp < 60000)) {
-    return configCache; // 60秒内走高频内存读取 
+    return configCache; 
   }
 
   const rows = await env.DB.prepare('SELECT key, value FROM system_config').all();
@@ -557,7 +539,7 @@ async function ensureTables(env) {
     await env.DB.exec(CREATE_TABLES_SQL);
     tablesReady = true;
   } catch (err) {
-    console.error('建表失败:', err);
+    console.error('自动初始化表失败:', err);
   }
 }
 
@@ -573,10 +555,9 @@ function parseCookies(header) {
 }
 
 // ==========================================
-// 4. 🎨 全局多端高度自适应 UI 页面渲染函数
+// 4. 🎨 全局多端高度自适应 UI 页面渲染模板
 // ==========================================
 
-// 后台共享导航组件布局 
 function getHeaderNav(session) {
   const hasUserManage = session.role === 'superuser' || session.permissions.includes('user:manage:restricted') || session.permissions.includes('user:manage:all');
   const hasLogs = session.role === 'superuser' || session.permissions.includes('log:view:all');
@@ -593,12 +574,12 @@ function getHeaderNav(session) {
         <a href="/logout" class="logout-btn">退出</a>
       </div>
     </div>
-    <div class="user-badge">当前身份: <strong>${session.username}</strong> [${session.role.toUpperCase()}]</div>
+    <div class="user-badge">当前会话主体: <strong>${session.username}</strong> [${session.role.toUpperCase()}]</div>
   `;
 }
 
 function generateLoginPage() {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>安全登录</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>安全认证登录</title>
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
     body { font-family:-apple-system,system-ui,sans-serif; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); min-height:100vh; display:flex; justify-content:center; align-items:center; padding:16px; color:#f8fafc; }
@@ -614,12 +595,12 @@ function generateLoginPage() {
   </style></head>
   <body>
     <div class="card">
-      <div class="h"><h2>📧 集中邮件收件系统</h2></div>
+      <div class="h"><h2>📧 邮件接收管理系统</h2></div>
       <div class="err" id="e"></div>
       <form id="f">
         <div class="g"><label>用户名</label><input type="text" id="u" required autofocus></div>
         <div class="g"><label>安全密码</label><input type="password" id="p" required></div>
-        <button type="submit" class="btn">认证登录</button>
+        <button type="submit" class="btn">安全登录</button>
       </form>
     </div>
     <script>
@@ -672,7 +653,7 @@ function generateListPage(messages, session) {
       async function delMail(id) {
         if(confirm('核实要彻底删除此邮件记录吗？')) {
           const res = await fetch('/delete/' + id, { method:'POST' });
-          if(res.ok) location.reload(); else alert('无权删除或系统被拦截');
+          if(res.ok) location.reload(); else alert('无权删除或操作被拦截');
         }
       }
     </script>
@@ -739,7 +720,7 @@ function generateUserPage(users, session) {
         <form id="uForm">
           <input type="hidden" id="userId">
           <div class="f-grid">
-            <div><label>用户名</label><input type="text" id="uName" class="input" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;" required></div>
+            <div><label>用户名</label><input type="text" id="uName" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;" required></div>
             <div><label>密码 (编辑时留空代表不修改)</label><input type="password" id="uPass" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;"></div>
           </div>
           <div class="f-grid">
@@ -752,15 +733,15 @@ function generateUserPage(users, session) {
             <div><label>专属保障邮箱</label><input type="text" id="uEmail" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;"></div>
           </div>
           <div class="g" style="margin-bottom:12px;">
-            <label>权限集 (JSON 数组格式串)</label>
+            <label>权限集 (JSON 数组格式)</label>
             <input type="text" id="uPerms" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;" value='["mail:view:own","mail:delete:own"]'>
           </div>
           <div class="g" style="margin-bottom:12px;">
-            <label>有权查看的具体邮箱/域名列表 (JSON 数组串)</label>
+            <label>有权查看的具体邮箱/域名列表 (JSON 数组)</label>
             <input type="text" id="uAccess" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;" value='[]'>
           </div>
           <div class="g" style="margin-bottom:12px;">
-            <label><input type="checkbox" id="uDisabled"> 是否实施账号强制封禁封锁</label>
+            <label><input type="checkbox" id="uDisabled"> 封禁此账户</label>
           </div>
           <button type="submit" class="btn">保存提交</button>
           <button type="button" class="btn" style="background:#64748b;" onclick="hideForm()">取消</button>
@@ -770,7 +751,7 @@ function generateUserPage(users, session) {
 
       <div class="wrapper" style="overflow-x:auto;">
         <table>
-          <thead><tr><th>用户名</th><th>角色</th><th>专属邮箱</th><th>拥有的功能权限集</th><th>允许穿透查看的域/箱</th><th>状态</th><th>管理</th></tr></thead>
+          <thead><tr><th>用户名</th><th>角色</th><th>专属邮箱</th><th>权限集</th><th>允许访问域/箱</th><th>状态</th><th>管理</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
@@ -825,7 +806,7 @@ function generateUserPage(users, session) {
       };
 
       async function deleteUser() {
-        if(confirm('确定要彻底注销并注销删除该用户账号吗？')) {
+        if(confirm('确定要彻底注销并删除该用户账号吗？')) {
           const body = { action: 'delete', id: document.getElementById('userId').value };
           const res = await fetch('/admin/users', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
           if(res.ok) location.reload(); else alert('注销失败，权限受阻');
@@ -862,7 +843,7 @@ function generateLogPage(logs, session) {
   <body>
     <div class="container">
       ${getHeaderNav(session)}
-      <h3 style="margin-bottom:12px; font-size:16px;">📋 实时系统底层全量审计日志面板</h3>
+      <h3 style="margin-bottom:12px; font-size:16px;">📋 实时系统审计日志面板</h3>
       <div class="wrapper" style="overflow-x:auto;">
         <table>
           <thead><tr><th>发生时间</th><th>行为类别</th><th>操作主体</th><th>行为详情描述</th><th>执行状态</th><th>客户端IP</th></tr></thead>
@@ -874,8 +855,8 @@ function generateLogPage(logs, session) {
 }
 
 function generateSettingsPage(config, session) {
-  const isReadonly = !session.role === 'superuser' && !session.permissions.includes('system:config:edit');
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>全局系统核心配置</title>
+  const isReadonly = session.role !== 'superuser' && !session.permissions.includes('system:config:edit');
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>系统核心配置</title>
   <style>${getCommonCss()}
     .box { background:#fff; padding:24px; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.05); max-width:600px; margin:0 auto; }
   </style></head>
@@ -883,17 +864,17 @@ function generateSettingsPage(config, session) {
     <div class="container">
       ${getHeaderNav(session)}
       <div class="box">
-        <h3 style="margin-bottom:16px; font-size:16px;">⚙️ 全局核心控制设置策略面板</h3>
+        <h3 style="margin-bottom:16px; font-size:16px;">⚙️ 全局核心设置策略面板</h3>
         <form id="sForm">
           <div class="g" style="margin-bottom:16px;">
-            <label style="display:block; font-weight:500; margin-bottom:6px;">允许接收邮件的域名后缀白名单（一行一个域名，留空不限制）</label>
+            <label style="display:block; font-weight:500; margin-bottom:6px;">允许接收邮件的域名后缀白名单（一行一个，留空不限制）</label>
             <textarea id="domains" style="width:100%; height:100px; padding:10px; border:1px solid #cbd5e1; border-radius:6px;" ${isReadonly?'disabled':''}>${(config.allowed_domains || []).join('\n')}</textarea>
           </div>
           <div class="g" style="margin-bottom:20px;">
-            <label style="display:block; font-weight:500; margin-bottom:6px;">系统下发登录凭证 JWT 有效租期 (小时)</label>
+            <label style="display:block; font-weight:500; margin-bottom:6px;">登录凭证 JWT 有效租期 (小时)</label>
             <input type="number" id="expiry" value="${config.session_expiry_hours || 24}" style="width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;" ${isReadonly?'disabled':''}>
           </div>
-          ${isReadonly ? '<p style="color:#ef4444;font-size:13px;">您当前持有的安全角色仅允许查阅，不开放修改权限。</p>' : '<button type="submit" class="btn">持久化应用并动态刷新热重载</button>'}
+          ${isReadonly ? '<p style="color:#ef4444;font-size:13px;">您当前持有的安全角色仅允许查阅，无修改权限。</p>' : '<button type="submit" class="btn">持久化应用并刷新热重载</button>'}
         </form>
       </div>
     </div>
@@ -906,14 +887,13 @@ function generateSettingsPage(config, session) {
             session_expiry_hours: parseInt(document.getElementById('expiry').value, 10)
           };
           const res = await fetch('/admin/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
-          if(res.ok) alert('策略修改持久化成功，系统已执行无感全局配置重新加载！'); else alert('执行失败');
+          if(res.ok) alert('修改成功，系统已执行配置无感热重载！'); else alert('执行失败');
         }
       }
     </script>
   </body></html>`;
 }
 
-// 提取公用的轻量全局响应式 CSS 架构
 function getCommonCss() {
   return `
     * { margin:0; padding:0; box-sizing:border-box; }
@@ -943,4 +923,17 @@ function getCommonCss() {
     .del-btn { padding:6px 12px; background:#fff; color:#ef4444; border:1px solid #fee2e2; border-radius:6px; cursor:pointer; font-size:12px; transition:0.2s; }
     .del-btn:hover { background:#ef4444; color:#fff; }
   `;
+}
+
+// ==========================================
+// 5. 底层全局公共辅助转换函数 (移至文件最下方，防止作用域未定义报错)
+// ==========================================
+function escapeHtml(unsafe) {
+  if (!unsafe) return '';
+  return String(unsafe)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }
