@@ -1,11 +1,53 @@
 import PostalMime from 'postal-mime';
 
+// ==========================================
+// 1. 数据库初始化 SQL (包含用户、设置、日志、邮件)
+// ==========================================
 const CREATE_TABLES_SQL = `
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    email TEXT,
+    role TEXT NOT NULL,
+    permissions TEXT NOT NULL,
+    accessible_emails TEXT NOT NULL,
+    token_version INTEGER DEFAULT 1,
+    disabled BOOLEAN DEFAULT 0,
+    created_by INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_token_version ON users(token_version);
+
+CREATE TABLE IF NOT EXISTS system_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_by INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT,
+    details TEXT NOT NULL,
+    ip TEXT,
+    user_agent TEXT,
+    success BOOLEAN NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_logs_created_at ON audit_logs(created_at);
+
 CREATE TABLE IF NOT EXISTS mailboxes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT UNIQUE NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mailbox_id INTEGER NOT NULL,
@@ -21,194 +63,493 @@ CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages(mailbox_id);
 CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at);
 `;
 
+// ==========================================
+// 2. 全局状态与内存缓存
+// ==========================================
 let tablesReady = false;
+let configCache = null;
+let cacheTimestamp = 0;
 
 export default {
-  // 1. 接收邮件入口
+  // 📥 邮件路由接收入口
   async email(message, env, ctx) {
     await ensureTables(env);
     const toAddress = message.to;
     if (!toAddress) return;
+
     try {
+      // 检查系统设置中的接收域名白名单限制 [cite: 15]
+      const config = await getSystemConfig(env);
+      if (config.allowed_domains && config.allowed_domains.length > 0) {
+        const domain = toAddress.split('@')[1];
+        if (!config.allowed_domains.includes(domain)) {
+          console.warn(`⚠️ 拒收非白名单域名的邮件: ${toAddress}`);
+          return;
+        }
+      }
+
       const parser = new PostalMime();
       const parsedEmail = await parser.parse(message.raw);
+      
       let mailbox = await env.DB.prepare('SELECT id FROM mailboxes WHERE email = ?').bind(toAddress).first();
       if (!mailbox) {
         const result = await env.DB.prepare('INSERT INTO mailboxes (email) VALUES (?)').bind(toAddress).run();
         mailbox = { id: result.meta.last_row_id };
       }
+
       await env.DB.prepare(
         `INSERT INTO messages (mailbox_id, from_address, subject, content, html_content)
          VALUES (?, ?, ?, ?, ?)`
       ).bind(mailbox.id, parsedEmail.from?.address || 'Unknown', parsedEmail.subject || '(无主题)',
         parsedEmail.text || parsedEmail.html || '(无内容)', parsedEmail.html || null).run();
-      console.log(`✅ 邮件已存储: ${toAddress} 来自 ${parsedEmail.from?.address}`);
     } catch (error) {
       console.error('❌ 处理邮件失败:', error);
     }
   },
 
-  // 2. Web 后台管理入口
+  // 🌐 Web 管理后台处理入口
   async fetch(request, env, ctx) {
     await ensureTables(env);
     const url = new URL(request.url);
     const path = url.pathname;
-    
-    const PASSWORD_RAW = env.PASSWORD || 'admin123';
-    const SECRET_KEY = env.SECRET_KEY || 'your-secret-key-change-me';
+    const clientIp = request.headers.get('CF-Connecting-IP') || '0.0.0.0';
+    const userAgent = request.headers.get('User-Agent') || '';
 
-    const getPasswordList = () => {
-      return PASSWORD_RAW.split(',').map(p => p.trim()).filter(Boolean);
-    };
+    // 从环境变量中读取基础凭证 
+    const SUPER_USER = env.SUPER_USERNAME || 'superuser';
+    const SUPER_PASS = env.SUPER_PASSWORD || 'superpassword123';
+    const JWT_SECRET = env.JWT_SECRET || 'a-very-secret-string-more-than-32-chars';
 
-    const getPwdHash = async (pwd) => {
+    // ------------------------------------------
+    // 🔒 核心加密工具 (PBKDF2 哈希与 JWT 纯原生实现)
+    // ------------------------------------------
+    const hashPassword = async (password) => {
       const encoder = new TextEncoder();
-      const data = encoder.encode(pwd);
-      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-      return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-    };
-
-    const generateToken = async (timestamp, pwdHash) => {
-      const encoder = new TextEncoder();
-      const secretKeyData = encoder.encode(SECRET_KEY);
-      const key = await crypto.subtle.importKey(
-        'raw', secretKeyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+      const salt = encoder.encode('cf_mail_worker_salt_fixed'); 
+      const baseKey = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits', 'deriveKey']);
+      const derivedKey = await crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' },
+        baseKey, { name: 'AES-GCM', length: 256 }, true, ['encrypt']
       );
-      const messageData = encoder.encode(`${timestamp}:${pwdHash}`);
-      const mac = await crypto.subtle.sign('HMAC', key, messageData);
-      const hashArray = Array.from(new Uint8Array(mac));
-      const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-      return `${timestamp}.${pwdHash}.${hash}`;
+      const exported = await crypto.subtle.exportKey('raw', derivedKey);
+      return Array.from(new Uint8Array(exported)).map(b => b.toString(16).padStart(2, '0')).join('');
     };
 
-    const checkAuth = async (req) => {
-      const cookies = parseCookies(req.headers.get('Cookie') || '');
-      if (!cookies.auth_token) return false;
-      
-      const parts = cookies.auth_token.split('.');
-      if (parts.length !== 3) return false;
-      
-      const [timestampStr, tokenPwdHash, hash] = parts;
-      const timestamp = parseInt(timestampStr, 10);
-      
-      if (isNaN(timestamp) || Date.now() - timestamp > 86400000) return false;
-      
-      const expectedToken = await generateToken(timestamp, tokenPwdHash);
-      if (cookies.auth_token !== expectedToken) return false;
-
-      const currentPasswords = getPasswordList();
-      const validHashes = await Promise.all(currentPasswords.map(p => getPwdHash(p)));
-      return validHashes.includes(tokenPwdHash);
+    const base64UrlEncode = (str) => btoa(str).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const base64UrlDecode = (str) => {
+      str = str.replace(/-/g, '+').replace(/_/g, '/');
+      while (str.length % 4) str += '=';
+      return atob(str);
     };
 
-    const parseCookies = (cookieHeader) => {
-      const cookies = {};
-      if (cookieHeader) {
-        cookieHeader.split(';').forEach(cookie => {
-          const [name, value] = cookie.trim().split('=');
-          if (name && value) cookies[name] = decodeURIComponent(value);
-        });
+    const generateJWT = async (payload) => {
+      const header = { alg: 'HS256', typ: 'JWT' };
+      const encodedHeader = base64UrlEncode(JSON.stringify(header));
+      const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+      
+      const encoder = new TextEncoder();
+      const key = await crypto.subtle.importKey('raw', encoder.encode(JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(`${encodedHeader}.${encodedPayload}`));
+      const encodedSignature = base64UrlEncode(String.fromCharCode(...new Uint8Array(signature)));
+      
+      return `${encodedHeader}.${encodedPayload}.${encodedSignature}`;
+    };
+
+    const verifyJWT = async (token) => {
+      try {
+        const parts = token.split('.');
+        if (parts.length !== 3) return null;
+        const [encodedHeader, encodedPayload, encodedSignature] = parts;
+        
+        const encoder = new TextEncoder();
+        const key = await crypto.subtle.importKey('raw', encoder.encode(JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+        const data = encoder.encode(`${encodedHeader}.${encodedPayload}`);
+        
+        const sigBytes = new Uint8Array(base64UrlDecode(encodedSignature).split('').map(c => c.charCodeAt(0)));
+        const valid = await crypto.subtle.verify('HMAC', key, sigBytes, data);
+        
+        if (!valid) return null;
+        const payload = JSON.parse(base64UrlDecode(encodedPayload));
+        if (Date.now() > payload.exp) return null; // 令牌过期 
+        return payload;
+      } catch (e) {
+        return null;
       }
-      return cookies;
     };
 
-    // 路由分发
+    // 🛡️ 鉴权中间件逻辑 
+    const getSession = async () => {
+      const cookies = parseCookies(request.headers.get('Cookie') || '');
+      if (!cookies.auth_token) return null;
+      
+      const payload = await verifyJWT(cookies.auth_token);
+      if (!payload) return null;
+
+      // 如果是超管身份，直接放行 
+      if (payload.user_id === 0) return payload;
+
+      // 如果是普通用户/管理员，从 D1 实时进行校验 
+      const dbUser = await env.DB.prepare('SELECT token_version, disabled, permissions, accessible_emails FROM users WHERE id = ?')
+        .bind(payload.user_id).first();
+      
+      if (!dbUser || dbUser.disabled === 1 || dbUser.token_version !== payload.token_version) {
+        return null; // 强制下线 
+      }
+
+      // 将最新数据库里的权限同步附加
+      payload.permissions = JSON.parse(dbUser.permissions);
+      payload.accessible_emails = JSON.parse(dbUser.accessible_emails);
+      return payload;
+    };
+
+    // 🏗️ 审计日志异步记录辅助器 [cite: 29]
+    const logAction = (userId, username, action, targetType, targetId, description, success) => {
+      ctx.waitUntil((async () => {
+        try {
+          await env.DB.prepare(
+            `INSERT INTO audit_logs (user_id, username, action, target_type, target_id, details, ip, user_agent, success)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(userId, username, action, targetType, targetId ? String(targetId) : null, JSON.stringify({ description }), success ? 1 : 0).run();
+        } catch (e) {
+          console.error('写入审计日志失败:', e);
+        }
+      })());
+    };
+
+    // ------------------------------------------
+    // ⚙️ 路由流控制
+    // ------------------------------------------
+    
+    // API: 登录提交 
+    if (path === '/api/login' && request.method === 'POST') {
+      try {
+        const formData = await request.formData();
+        const username = formData.get('username') || '';
+        const password = formData.get('password') || '';
+        const config = await getSystemConfig(env);
+        const expiryHours = config.session_expiry_hours || 24;
+
+        // 1. 验证是否匹配超管 
+        if (username === SUPER_USER && password === SUPER_PASS) {
+          const jwt = await generateJWT({
+            user_id: 0,
+            username: SUPER_USER,
+            role: 'superuser',
+            permissions: ['*'],
+            token_version: 0,
+            exp: Date.now() + (expiryHours * 60 * 60 * 1000)
+          });
+          logAction(0, SUPER_USER, 'login', 'user', '0', '超级管理员登录成功', true);
+          return new Response(JSON.stringify({ success: true }), {
+            headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${expiryHours * 3600}` }
+          });
+        }
+
+        // 2. 验证常规数据库用户 
+        const user = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
+        if (user) {
+          if (user.disabled === 1) {
+            logAction(user.id, username, 'login', 'user', user.id, '登录失败: 账户已被封禁', false);
+            return new Response(JSON.stringify({ success: false, message: '账户已被封禁' }), { status: 403 });
+          }
+          const inputHash = await hashPassword(password);
+          if (inputHash === user.password_hash) {
+            const jwt = await generateJWT({
+              user_id: user.id,
+              username: user.username,
+              role: user.role,
+              permissions: JSON.parse(user.permissions),
+              token_version: user.token_version,
+              exp: Date.now() + (expiryHours * 60 * 60 * 1000)
+            });
+            logAction(user.id, username, 'login', 'user', user.id, '用户登录成功', true);
+            return new Response(JSON.stringify({ success: true }), {
+              headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${expiryHours * 3600}` }
+            });
+          }
+        }
+
+        logAction(-1, username, 'login', 'user', null, '登录失败: 凭证错误', false);
+        return new Response(JSON.stringify({ success: false, message: '用户名或密码错误' }), { status: 401 });
+      } catch (e) {
+        return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
+      }
+    }
+
+    // 页面: 登录页渲染 
     if (path === '/login' && request.method === 'GET') {
       return new Response(generateLoginPage(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    if (path === '/login' && request.method === 'POST') {
-      try {
-        const formData = await request.formData();
-        const inputPassword = formData.get('password') || '';
-        const currentPasswords = getPasswordList();
-        
-        if (currentPasswords.includes(inputPassword)) {
-          const pwdHash = await getPwdHash(inputPassword);
-          const token = await generateToken(Date.now(), pwdHash);
-          return new Response(null, {
-            status: 302,
-            headers: {
-              'Location': '/',
-              'Set-Cookie': `auth_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400`
-            }
-          });
-        } else {
-          return new Response(generateLoginPage('密码错误，请重试'), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-        }
-      } catch (error) {
-        return new Response(generateLoginPage('登录失败: ' + error.message), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-      }
-    }
-
-    if (path === '/' || path === '') {
-      if (!(await checkAuth(request))) {
-        return new Response(null, { status: 302, headers: { 'Location': '/login' } });
-      }
-      try {
-        const messages = await env.DB.prepare(
-          `SELECT m.*, mb.email as mailbox_email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id ORDER BY m.received_at DESC`
-        ).all();
-        return new Response(generateListPage(messages.results), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-      } catch (error) {
-        return new Response('加载邮件列表失败: ' + error.message, { status: 500 });
-      }
-    }
-
-    if (path.startsWith('/view/')) {
-      if (!(await checkAuth(request))) {
-        return new Response(null, { status: 302, headers: { 'Location': '/login' } });
-      }
-      const messageId = path.split('/')[2];
-      if (!messageId) return new Response('缺少邮件ID', { status: 400 });
-      try {
-        const message = await env.DB.prepare(
-          `SELECT m.*, mb.email as mailbox_email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?`
-        ).bind(messageId).first();
-        if (!message) return new Response('邮件未找到', { status: 404 });
-        await env.DB.prepare('UPDATE messages SET is_read = 1 WHERE id = ?').bind(messageId).run();
-        return new Response(generateDetailPage(message), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-      } catch (error) {
-        return new Response('加载邮件详情失败: ' + error.message, { status: 500 });
-      }
-    }
-
-    if (path.startsWith('/raw-html/')) {
-      if (!(await checkAuth(request))) return new Response('Unauthorized', { status: 401 });
-      const messageId = path.split('/')[2];
-      const message = await env.DB.prepare('SELECT html_content, content FROM messages WHERE id = ?').bind(messageId).first();
-      if (!message) return new Response('Not Found', { status: 404 });
-      
-      const body = message.html_content || `<pre style="white-space: pre-wrap; font-family: monospace; padding:10px;">${escapeHtml(message.content)}</pre>`;
-      return new Response(body, {
-        headers: {
-          'Content-Type': 'text/html; charset=utf-8',
-          'Content-Security-Policy': "default-src 'self' http: https: data: 'unsafe-inline'; script-src 'none'; object-src 'none';" 
-        }
-      });
-    }
-
-    if (path.startsWith('/delete/')) {
-      if (!(await checkAuth(request))) return new Response(null, { status: 302, headers: { 'Location': '/login' } });
-      const messageId = path.split('/')[2];
-      try {
-        await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(messageId).run();
-        return new Response('邮件已删除', { status: 200 });
-      } catch (error) {
-        return new Response('删除失败: ' + error.message, { status: 500 });
-      }
-    }
-
+    // 🚪 退出登录 
     if (path === '/logout') {
+      const session = await getSession();
+      if (session) logAction(session.user_id, session.username, 'logout', 'user', session.user_id, '注销退出登录', true);
       return new Response(null, {
         status: 302,
         headers: { 'Location': '/login', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' }
       });
     }
 
+    // ==========================================
+    // 🛡️ 以下路由均需通过 JWT 认证中间件
+    // ==========================================
+    const session = await getSession();
+    if (!session) {
+      return new Response(null, { status: 302, headers: { 'Location': '/login' } });
+    }
+
+    const hasPermission = (perm) => session.role === 'superuser' || session.permissions.includes(perm);
+
+    // 🏠 路由: 邮件接收主列表首页 
+    if (path === '/' || path === '') {
+      try {
+        let querySql = `SELECT m.*, mb.email as mailbox_email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id`;
+        let bindParams = [];
+
+        // 🔐 精准的邮件数据可见性控制过滤 [cite: 2, 3]
+        if (session.role !== 'superuser' && !hasPermission('mail:view:all')) {
+          let conditions = [];
+          
+          // 关联自有的邮箱专属控制 [cite: 9]
+          if (hasPermission('mail:view:own') && session.email) {
+            conditions.push(`mb.email = ?`);
+            bindParams.push(session.email);
+          }
+          
+          // 可访问名单级联控制 [cite: 2, 3]
+          if (hasPermission('mail:view:allowed') && session.accessible_emails) {
+            session.accessible_emails.forEach(allowed => {
+              if (allowed.startsWith('@')) {
+                conditions.push(`mb.email LIKE ?`);
+                bindParams.push(`%${allowed}`);
+              } else {
+                conditions.push(`mb.email = ?`);
+                bindParams.push(allowed);
+              }
+            });
+          }
+
+          if (conditions.length === 0) {
+            return new Response(generateListPage([], session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+          }
+          querySql += ` WHERE ` + conditions.join(' OR ');
+        }
+
+        querySql += ` ORDER BY m.received_at DESC LIMIT 100`;
+        const stmt = env.DB.prepare(querySql);
+        const messages = await (bindParams.length > 0 ? stmt.bind(...bindParams) : stmt).all();
+        
+        logAction(session.user_id, session.username, 'view_logs', 'log', null, '查看邮件列表主控页', true);
+        return new Response(generateListPage(messages.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      } catch (e) {
+        return new Response('系统错误: ' + e.message, { status: 500 });
+      }
+    }
+
+    // 📄 路由: 详情查看页 
+    if (path.startsWith('/view/')) {
+      const messageId = path.split('/')[2];
+      try {
+        const message = await env.DB.prepare(
+          `SELECT m.*, mb.email as mailbox_email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?`
+        ).bind(messageId).first();
+
+        if (!message) return new Response('邮件不存在', { status: 404 });
+
+        // 校验邮件查看控制范畴 [cite: 2, 3]
+        if (!checkMailAccess(session, message.mailbox_email, 'view')) {
+          logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权查看邮件拦截: ${message.mailbox_email}`, false);
+          return new Response('无权查看该邮件', { status: 403 });
+        }
+
+        await env.DB.prepare('UPDATE messages SET is_read = 1 WHERE id = ?').bind(messageId).run();
+        logAction(session.user_id, session.username, 'view_message', 'message', messageId, `查看邮件主题: ${message.subject}`, true);
+        return new Response(generateDetailPage(message, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      } catch (e) {
+        return new Response('错误: ' + e.message, { status: 500 });
+      }
+    }
+
+    // 🛡️ 路由: 沙箱隔离富文本渲染内联入口 
+    if (path.startsWith('/raw-html/')) {
+      const messageId = path.split('/')[2];
+      const message = await env.DB.prepare('SELECT m.html_content, m.content, mb.email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?').bind(messageId).first();
+      if (!message) return new Response('Not Found', { status: 404 });
+      
+      if (!checkMailAccess(session, message.email, 'view')) return new Response('Forbidden', { status: 403 });
+
+      const body = message.html_content || `<pre style="white-space: pre-wrap; font-family: monospace; padding:12px; color:#1e293b;">${escapeHtml(message.content)}</pre>`;
+      return new Response(body, {
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Content-Security-Policy': "default-src 'self' http: https: data: 'unsafe-inline'; script-src 'none'; object-src 'none';"
+        }
+      });
+    }
+
+    // 🗑️ 路由: 邮件删除接口 
+    if (path.startsWith('/delete/') && request.method === 'POST') {
+      const messageId = path.split('/')[2];
+      try {
+        const message = await env.DB.prepare('SELECT mb.email FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?').bind(messageId).first();
+        if (!message) return new Response('邮件未找到', { status: 404 });
+
+        // 级联检验删除权限与范围 [cite: 3, 4]
+        if (!checkMailAccess(session, message.email, 'delete')) {
+          logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权执行删除邮件拦截: ${message.email}`, false);
+          return new Response('无操作权限', { status: 403 });
+        }
+
+        await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(messageId).run();
+        logAction(session.user_id, session.username, 'delete_message', 'message', messageId, `彻底清除了邮件 ID: ${messageId}`, true);
+        return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) {
+        return new Response(e.message, { status: 500 });
+      }
+    }
+
+    // 👥 路由: 用户集中配置管理后台 (仅限具备 user:manage 权限的主体) 
+    if (path === '/admin/users') {
+      if (!hasPermission('user:manage:restricted') && !hasPermission('user:manage:all')) {
+        return new Response('无权访问管理面板', { status: 403 });
+      }
+
+      if (request.method === 'GET') {
+        const users = await env.DB.prepare('SELECT id, username, email, role, permissions, accessible_emails, disabled, created_at FROM users ORDER BY id DESC').all();
+        return new Response(generateUserPage(users.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      }
+
+      // 处理异步新增/编辑提交
+      if (request.method === 'POST') {
+        try {
+          const body = await request.json();
+          const { action, id, username, password, email, role, permissions, accessible_emails, disabled } = body;
+
+          // 级联权限隔离：受限管理员只能创建普通用户 [cite: 4, 5]
+          if (!hasPermission('user:manage:all') && role === 'admin') {
+            return new Response(JSON.stringify({ success: false, message: '您无权创建或提权管理员账户' }), { status: 403 });
+          }
+
+          if (action === 'create') {
+            const pwdHash = await hashPassword(password);
+            await env.DB.prepare(
+              `INSERT INTO users (username, password_hash, email, role, permissions, accessible_emails, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`
+            ).bind(username, pwdHash, email || null, role, JSON.stringify(permissions), JSON.stringify(accessible_emails), session.user_id).run();
+            
+            logAction(session.user_id, session.username, 'create_user', 'user', null, `成功创建了账户: ${username} [${role}]`, true);
+            return new Response(JSON.stringify({ success: true }));
+          }
+
+          if (action === 'update') {
+            // 保护机制：不允许非全权管理员篡改已存在的高管 [cite: 4, 5]
+            const target = await env.DB.prepare('SELECT role, token_version FROM users WHERE id = ?').bind(id).first();
+            if (target.role === 'admin' && !hasPermission('user:manage:all')) {
+              return new Response(JSON.stringify({ success: false, message: '权限不足，无法编辑管理员角色' }), { status: 403 });
+            }
+
+            let updateSql = `UPDATE users SET email = ?, role = ?, permissions = ?, accessible_emails = ?, disabled = ?, token_version = token_version + 1`;
+            let params = [email || null, role, JSON.stringify(permissions), JSON.stringify(accessible_emails), disabled ? 1 : 0];
+
+            if (password && password.trim() !== '') {
+              const newHash = await hashPassword(password);
+              updateSql += `, password_hash = ?`;
+              params.push(newHash);
+            }
+
+            updateSql += ` WHERE id = ?`;
+            params.push(id);
+
+            await env.DB.prepare(updateSql).bind(...params).run();
+            logAction(session.user_id, session.username, 'update_user', 'user', id, `编辑并更新了用户账户: ${username}，强制增加其令牌版本`, true);
+            return new Response(JSON.stringify({ success: true }));
+          }
+
+          if (action === 'delete') {
+            if (!hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '只有超级管理员或全权管理员有权注销账户' }), { status: 403 });
+            await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
+            logAction(session.user_id, session.username, 'delete_user', 'user', id, `删除了用户 ID: ${id}`, true);
+            return new Response(JSON.stringify({ success: true }));
+          }
+        } catch (e) {
+          return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
+        }
+      }
+    }
+
+    // 📋 路由: 集中审计日志面板 
+    if (path === '/admin/logs' && hasPermission('log:view:all')) {
+      const logs = await env.DB.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200').all();
+      return new Response(generateLogPage(logs.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+
+    // ⚙️ 路由: 全局配置面板页面 
+    if (path === '/admin/settings' && hasPermission('system:config:view')) {
+      if (request.method === 'GET') {
+        const config = await getSystemConfig(env);
+        return new Response(generateSettingsPage(config, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      }
+
+      if (request.method === 'POST' && hasPermission('system:config:edit')) {
+        try {
+          const body = await request.json();
+          // 更新 allowed_domains [cite: 15]
+          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
+            .bind('allowed_domains', JSON.stringify(body.allowed_domains || []), session.user_id).run();
+          // 更新 session_expiry_hours [cite: 15]
+          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
+            .bind('session_expiry_hours', JSON.stringify(parseInt(body.session_expiry_hours, 10) || 24), session.user_id).run();
+
+          // 主动使当前的全局变量缓存失效，完成热重载更新 
+          configCache = null; 
+          logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '重新调整了全局核心控制设置策略并完成了热重载', true);
+          return new Response(JSON.stringify({ success: true }));
+        } catch (e) {
+          return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
+        }
+      }
+    }
+
     return new Response('Not Found', { status: 404 });
   }
 };
+
+// ==========================================
+// 3. 核心策略校验与缓存机制辅助函数
+// ==========================================
+
+// 精准核对当前用户是否被允许操作某一邮件 [cite: 3, 4]
+function checkMailAccess(session, targetEmail, type) {
+  if (session.role === 'superuser' || session.permissions.includes(`mail:${type}:all`)) return true;
+  if (session.permissions.includes(`mail:${type}:own`) && session.email === targetEmail) return true;
+  
+  if (session.permissions.includes(`mail:${type}:allowed`) && session.accessible_emails) {
+    return session.accessible_emails.some(allowed => {
+      if (allowed.startsWith('@')) return targetEmail.endsWith(allowed);
+      return allowed === targetEmail;
+    });
+  }
+  return false;
+}
+
+// 动态免重启配置热重载获取方法 
+async function getSystemConfig(env) {
+  const now = Date.now();
+  if (configCache && (now - cacheTimestamp < 60000)) {
+    return configCache; // 60秒内走高频内存读取 
+  }
+
+  const rows = await env.DB.prepare('SELECT key, value FROM system_config').all();
+  const config = { allowed_domains: [], session_expiry_hours: 24 };
+  
+  rows.results.forEach(row => {
+    config[row.key] = JSON.parse(row.value);
+  });
+
+  configCache = config;
+  cacheTimestamp = now;
+  return config;
+}
 
 async function ensureTables(env) {
   if (tablesReady) return;
@@ -216,179 +557,390 @@ async function ensureTables(env) {
     await env.DB.exec(CREATE_TABLES_SQL);
     tablesReady = true;
   } catch (err) {
-    console.error('❌ 自动建表失败:', err);
+    console.error('建表失败:', err);
   }
 }
 
-function escapeHtml(unsafe) {
-  if (!unsafe) return '';
-  return unsafe.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+function parseCookies(header) {
+  const cookies = {};
+  if (header) {
+    header.split(';').forEach(c => {
+      const [name, value] = c.trim().split('=');
+      if (name && value) cookies[name] = decodeURIComponent(value);
+    });
+  }
+  return cookies;
 }
 
-// --- 💡 完美多端兼容的 HTML 模板区域 ---
+// ==========================================
+// 4. 🎨 全局多端高度自适应 UI 页面渲染函数
+// ==========================================
 
-function generateLoginPage(errorMessage = '') {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"><title>📧 登录</title>
+// 后台共享导航组件布局 
+function getHeaderNav(session) {
+  const hasUserManage = session.role === 'superuser' || session.permissions.includes('user:manage:restricted') || session.permissions.includes('user:manage:all');
+  const hasLogs = session.role === 'superuser' || session.permissions.includes('log:view:all');
+  const hasSettings = session.role === 'superuser' || session.permissions.includes('system:config:view');
+
+  return `
+    <div class="header">
+      <div class="nav-brand"><a href="/" style="color:#0f172a; text-decoration:none;">📬 邮件收件箱</a></div>
+      <div class="nav-links">
+        <a href="/" class="nav-item">列表</a>
+        ${hasUserManage ? `<a href="/admin/users" class="nav-item">用户</a>` : ''}
+        ${hasLogs ? `<a href="/admin/logs" class="nav-item">审计</a>` : ''}
+        ${hasSettings ? `<a href="/admin/settings" class="nav-item">系统</a>` : ''}
+        <a href="/logout" class="logout-btn">退出</a>
+      </div>
+    </div>
+    <div class="user-badge">当前身份: <strong>${session.username}</strong> [${session.role.toUpperCase()}]</div>
+  `;
+}
+
+function generateLoginPage() {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>安全登录</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 16px; color: #f8fafc; }
-    .login-container { background: #1e293b; border: 1px solid #334155; border-radius: 16px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.4); width: 100%; max-width: 380px; padding: 32px 24px; }
-    .login-header { text-align: center; margin-bottom: 24px; }
-    .login-header h2 { font-size: 22px; margin-top: 8px; color: #f1f5f9; }
-    .login-header p { color: #94a3b8; font-size: 13px; margin-top: 4px; }
-    .form-group { margin-bottom: 20px; }
-    .form-group label { display: block; margin-bottom: 8px; color: #cbd5e1; font-weight: 500; font-size: 14px; }
-    .form-group input { width: 100%; padding: 14px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; font-size: 15px; color: #fff; appearance: none; transition: border-color 0.2s; }
-    .form-group input:focus { outline: none; border-color: #3b82f6; }
-    .submit-btn { width: 100%; padding: 14px; background: #3b82f6; color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; -webkit-tap-highlight-color: transparent; }
-    .submit-btn:hover { background: #2563eb; }
-    .error-message { color: #ef4444; font-size: 13px; margin-bottom: 16px; padding: 10px; background-color: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.15); border-radius: 8px; }
-  </style>
-  </head>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:-apple-system,system-ui,sans-serif; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); min-height:100vh; display:flex; justify-content:center; align-items:center; padding:16px; color:#f8fafc; }
+    .card { background:#1e293b; border:1px solid #334155; border-radius:16px; width:100%; max-width:360px; padding:32px 24px; box-shadow:0 10px 25px -5px rgba(0,0,0,0.5); }
+    .h { text-align:center; margin-bottom:24px; }
+    .h h2 { font-size:20px; color:#f1f5f9; }
+    .g { margin-bottom:16px; }
+    .g label { display:block; margin-bottom:6px; color:#cbd5e1; font-size:14px; }
+    .g input { width:100%; padding:12px; background:#0f172a; border:1px solid #334155; border-radius:8px; color:#fff; font-size:14px; }
+    .g input:focus { outline:none; border-color:#3b82f6; }
+    .btn { width:100%; padding:12px; background:#3b82f6; color:#fff; border:none; border-radius:8px; font-size:15px; font-weight:600; cursor:pointer; }
+    .err { color:#ef4444; background:rgba(239,68,68,0.1); padding:10px; border-radius:6px; margin-bottom:16px; font-size:13px; display:none; }
+  </style></head>
   <body>
-    <div class="login-container">
-      <div class="login-header"><h1>📧</h1><h2>邮件收件箱</h2><p>请输入密码以继续</p></div>
-      <form method="POST" action="/login">
-        ${errorMessage ? `<div class="error-message">${escapeHtml(errorMessage)}</div>` : ''}
-        <div class="form-group">
-          <label for="password">安全密码</label>
-          <input type="password" id="password" name="password" required autofocus placeholder="••••••••">
-        </div>
-        <button type="submit" class="submit-btn">验证登录</button>
+    <div class="card">
+      <div class="h"><h2>📧 集中邮件收件系统</h2></div>
+      <div class="err" id="e"></div>
+      <form id="f">
+        <div class="g"><label>用户名</label><input type="text" id="u" required autofocus></div>
+        <div class="g"><label>安全密码</label><input type="password" id="p" required></div>
+        <button type="submit" class="btn">认证登录</button>
       </form>
+    </div>
+    <script>
+      document.getElementById('f').onsubmit = async (e) => {
+        e.preventDefault();
+        const err = document.getElementById('e');
+        err.style.display = 'none';
+        const fd = new URLSearchParams();
+        fd.append('username', document.getElementById('u').value);
+        fd.append('password', document.getElementById('p').value);
+        const res = await fetch('/api/login', { method:'POST', body:fd });
+        if(res.ok) { window.location.href = '/'; } 
+        else { const data = await res.json(); err.innerText = data.message; err.style.display='block'; }
+      }
+    </script>
+  </body></html>`;
+}
+
+function generateListPage(messages, session) {
+  const rows = messages.map(msg => `
+    <tr>
+      <td data-label="专属收件箱" style="font-weight:600; color:#0f172a;">${escapeHtml(msg.mailbox_email)}</td>
+      <td data-label="发件人">${escapeHtml(msg.from_address)}</td>
+      <td data-label="邮件主题"><a class="link" href="/view/${msg.id}">${msg.is_read ? '' : '✉️ '}${escapeHtml(msg.subject || '(无主题)')}</a></td>
+      <td data-label="到达时间" style="color:#64748b;">${new Date(msg.received_at).toLocaleString('zh-CN')}</td>
+      <td data-label="管理"><button class="del-btn" onclick="delMail(${msg.id})">删除</button></td>
+    </tr>
+  `).join('');
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>邮件收件箱</title>
+  <style>${getCommonCss()}
+    @media(max-width:768px){
+      thead{display:none;} tr{display:block; background:#fff; border-radius:8px; margin-bottom:12px; padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.05);}
+      td{display:flex; justify-content:space-between; padding:6px 0; border:none; text-align:right;}
+      td::before{content:attr(data-label); color:#64748b; font-weight:500;}
+      .del-btn{width:100%; text-align:center; margin-top:6px;}
+    }
+  </style></head>
+  <body>
+    <div class="container">
+      ${getHeaderNav(session)}
+      <div class="wrapper" style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>别名收件箱</th><th>发件人</th><th>主题</th><th>接收时间</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5" style="text-align:center;color:#94a3b8;">📭 目前尚无任何可支配的邮件。</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+    <script>
+      async function delMail(id) {
+        if(confirm('核实要彻底删除此邮件记录吗？')) {
+          const res = await fetch('/delete/' + id, { method:'POST' });
+          if(res.ok) location.reload(); else alert('无权删除或系统被拦截');
+        }
+      }
+    </script>
+  </body></html>`;
+}
+
+function generateDetailPage(message, session) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>邮件详情</title>
+  <style>${getCommonCss()}
+    .card { background:#fff; padding:20px; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
+    .sub { font-size:18px; font-weight:700; margin-bottom:16px; color:#0f172a; word-break:break-all; }
+    .grid { display:grid; grid-template-columns:auto 1fr; gap:8px 16px; font-size:13px; margin-bottom:20px; padding-bottom:16px; border-bottom:1px solid #f1f5f9; }
+    .lbl { color:#64748b; font-weight:500; }
+    iframe { width:100%; min-height:450px; border:1px solid #e2e8f0; border-radius:8px; display:block; }
+  </style></head>
+  <body>
+    <div class="container">
+      ${getHeaderNav(session)}
+      <a href="/" class="btn" style="display:inline-block; margin-bottom:12px; text-decoration:none; background:#f1f5f9; color:#475569;">← 返回收件箱</a>
+      <div class="card">
+        <div class="sub">${escapeHtml(message.subject || '(无主题)')}</div>
+        <div class="grid">
+          <div class="lbl">发件人</div><div>${escapeHtml(message.from_address)}</div>
+          <div class="lbl">收件人</div><div>${escapeHtml(message.mailbox_email)}</div>
+          <div class="lbl">到达时间</div><div>${new Date(message.received_at).toLocaleString()}</div>
+        </div>
+        <iframe src="/raw-html/${message.id}" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>
+      </div>
     </div>
   </body></html>`;
 }
 
-function generateListPage(messages) {
-  const rows = messages.map(msg => `
-    <tr class="${msg.is_read ? 'read' : 'unread'}">
-      <td data-label="别名收件箱" style="font-weight: 600; color:#0f172a;">${escapeHtml(msg.mailbox_email)}</td>
-      <td data-label="发件人" class="truncate">${escapeHtml(msg.from_address)}</td>
-      <td data-label="邮件主题"><a class="subject-link" href="/view/${msg.id}">${escapeHtml(msg.subject || '(无主题)')}</a></td>
-      <td data-label="到达时间" class="time-col">${new Date(msg.received_at).toLocaleString('zh-CN', {hour12:false})}</td>
-      <td data-label="状态"><span class="badge ${msg.is_read ? 'badge-read' : 'badge-unread'}">${msg.is_read ? '已读' : '未读'}</span></td>
-      <td data-label="管理"><button class="delete-btn" onclick="deleteEmail(${msg.id}, event)">删除</button></td>
+function generateUserPage(users, session) {
+  const rows = users.map(u => `
+    <tr>
+      <td>${escapeHtml(u.username)}</td>
+      <td><span class="badge" style="background:#e0f2fe;color:#0369a1;">${u.role.toUpperCase()}</span></td>
+      <td>${escapeHtml(u.email || '未挂载')}</td>
+      <td><small style="font-size:11px; color:#64748b; max-width:200px; display:block; overflow:hidden;">${escapeHtml(u.permissions)}</small></td>
+      <td><small style="font-size:11px; color:#64748b;">${escapeHtml(u.accessible_emails)}</small></td>
+      <td>${u.disabled ? '❌ 封禁' : '✅ 正常'}</td>
+      <td>
+        <button class="btn" style="padding:4px 8px; background:#f1f5f9; color:#0f172a; font-size:12px;" onclick="editUser(${JSON.stringify(u).replace(/"/g, '&quot;')})">编辑</button>
+      </td>
     </tr>
   `).join('');
 
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>📧 收件箱</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f8fafc; color: #1e293b; padding: 12px; }
-    .container { max-width: 1200px; margin: 0 auto; padding-top: 8px; }
-    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; background: white; padding: 16px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-    .header h1 { font-size: 18px; font-weight: 700; color: #0f172a; }
-    .logout-btn { padding: 8px 14px; background: #f1f5f9; color: #64748b; text-decoration: none; border-radius: 6px; font-size: 13px; font-weight: 500; }
-    .table-wrapper { background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); overflow: hidden; }
-    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 14px; }
-    th { background: #f8fafc; padding: 14px 16px; font-weight: 600; color: #64748b; border-bottom: 1px solid #e2e8f0; }
-    td { padding: 14px 16px; border-bottom: 1px solid #f1f5f9; color: #334155; }
-    tr:hover { background-color: #f8fafc; }
-    tr.unread { background-color: #f0fdf4; }
-    .subject-link { color: #2563eb; text-decoration: none; font-weight: 500; display: inline-block; word-break: break-all; }
-    .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
-    .badge-unread { background: #dcfce7; color: #166534; }
-    .badge-read { background: #f1f5f9; color: #64748b; }
-    .delete-btn { padding: 6px 14px; background: #fff; color: #ef4444; border: 1px solid #fee2e2; border-radius: 6px; cursor: pointer; font-size: 13px; }
-    .empty { text-align: center; padding: 40px; color: #94a3b8; }
-    .truncate { max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-    /* 📱 核心响应式移动端 CSS 媒体查询 断点 */
-    @media (max-width: 768px) {
-      .header h1 { font-size: 16px; }
-      thead { display: none; } /* 隐藏原生表头 */
-      tr { display: block; border-bottom: 8px solid #f1f5f9; padding: 12px 4px; background: #fff; }
-      tr.unread { background-color: #fcfdfd; border-left: 4px solid #22c55e; }
-      td { display: flex; justify-content: space-between; align-items: center; border-bottom: none; padding: 8px 12px; text-align: right; font-size: 13px; }
-      td::before { content: attr(data-label); font-weight: 500; color: #64748b; padding-right: 16px; text-align: left; min-width: 90px; }
-      .truncate { max-width: 60%; white-space: normal; overflow: visible; text-overflow: clip; word-break: break-all; }
-      .subject-link { text-align: right; max-width: 100%; }
-      .delete-btn { width: 100%; text-align: center; padding: 8px; margin-top: 4px; }
-    }
-  </style>
-  <script>
-    function deleteEmail(id, e) {
-      e.preventDefault();
-      if (confirm('确定要彻底删除该邮件吗？')) {
-        fetch('/delete/' + id, { method: 'POST' }).then(() => location.reload());
-      }
-    }
-  </script>
-  </head>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>用户授权管理</title>
+  <style>${getCommonCss()}
+    .m-card { background:#fff; padding:20px; border-radius:12px; margin-bottom:16px; display:none; border:1px solid #e2e8f0; }
+    .f-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px; }
+    @media(max-width:768px){ .f-grid { grid-template-columns:1fr; } }
+  </style></head>
   <body>
     <div class="container">
-      <div class="header"><h1>📬 临时收件箱 (${messages.length})</h1><a href="/logout" class="logout-btn">安全退出</a></div>
-      <div class="table-wrapper">
+      ${getHeaderNav(session)}
+      <div style="display:flex; justify-content:space-between; margin-bottom:12px;">
+        <h3 style="font-size:16px;">👤 系统授权用户列表</h3>
+        <button class="btn" onclick="showCreateForm()">+ 新增分配用户</button>
+      </div>
+
+      <div class="m-card" id="formCard">
+        <h4 id="fTitle" style="margin-bottom:12px;">新增账号</h4>
+        <form id="uForm">
+          <input type="hidden" id="userId">
+          <div class="f-grid">
+            <div><label>用户名</label><input type="text" id="uName" class="input" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;" required></div>
+            <div><label>密码 (编辑时留空代表不修改)</label><input type="password" id="uPass" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;"></div>
+          </div>
+          <div class="f-grid">
+            <div><label>角色类型</label>
+              <select id="uRole" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;">
+                <option value="user">普通用户 (USER)</option>
+                <option value="admin">管理员 (ADMIN)</option>
+              </select>
+            </div>
+            <div><label>专属保障邮箱</label><input type="text" id="uEmail" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;"></div>
+          </div>
+          <div class="g" style="margin-bottom:12px;">
+            <label>权限集 (JSON 数组格式串)</label>
+            <input type="text" id="uPerms" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;" value='["mail:view:own","mail:delete:own"]'>
+          </div>
+          <div class="g" style="margin-bottom:12px;">
+            <label>有权查看的具体邮箱/域名列表 (JSON 数组串)</label>
+            <input type="text" id="uAccess" style="width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:6px;" value='[]'>
+          </div>
+          <div class="g" style="margin-bottom:12px;">
+            <label><input type="checkbox" id="uDisabled"> 是否实施账号强制封禁封锁</label>
+          </div>
+          <button type="submit" class="btn">保存提交</button>
+          <button type="button" class="btn" style="background:#64748b;" onclick="hideForm()">取消</button>
+          <button type="button" id="delBtn" class="btn" style="background:#ef4444; display:none;" onclick="deleteUser()">注销该账号</button>
+        </form>
+      </div>
+
+      <div class="wrapper" style="overflow-x:auto;">
         <table>
-          <thead><tr><th>别名收件箱</th><th>发件人</th><th>邮件主题</th><th>到达时间</th><th>状态</th><th>管理</th></tr></thead>
-          <tbody>
-            ${rows ? rows : '<tr><td colspan="6" class="empty">📭 暂无任何邮件。</td></tr>'}
-          </tbody>
+          <thead><tr><th>用户名</th><th>角色</th><th>专属邮箱</th><th>拥有的功能权限集</th><th>允许穿透查看的域/箱</th><th>状态</th><th>管理</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+    <script>
+      let currentAction = 'create';
+      function showCreateForm() {
+        currentAction = 'create';
+        document.getElementById('fTitle').innerText = '新增策略授权账号';
+        document.getElementById('userId').value = '';
+        document.getElementById('uName').value = ''; document.getElementById('uName').disabled = false;
+        document.getElementById('uPass').required = true;
+        document.getElementById('uEmail').value = '';
+        document.getElementById('uRole').value = 'user';
+        document.getElementById('uPerms').value = '["mail:view:own","mail:delete:own"]';
+        document.getElementById('uAccess').value = '[]';
+        document.getElementById('uDisabled').checked = false;
+        document.getElementById('delBtn').style.display = 'none';
+        document.getElementById('formCard').style.display = 'block';
+      }
+      function editUser(u) {
+        currentAction = 'update';
+        document.getElementById('fTitle').innerText = '修改授权账户策略';
+        document.getElementById('userId').value = u.id;
+        document.getElementById('uName').value = u.username; document.getElementById('uName').disabled = true;
+        document.getElementById('uPass').required = false;
+        document.getElementById('uEmail').value = u.email || '';
+        document.getElementById('uRole').value = u.role;
+        document.getElementById('uPerms').value = JSON.stringify(u.permissions);
+        document.getElementById('uAccess').value = JSON.stringify(u.accessible_emails);
+        document.getElementById('uDisabled').checked = u.disabled === 1;
+        document.getElementById('delBtn').style.display = 'inline-block';
+        document.getElementById('formCard').style.display = 'block';
+      }
+      function hideForm() { document.getElementById('formCard').style.display = 'none'; }
+      
+      document.getElementById('uForm').onsubmit = async (e) => {
+        e.preventDefault();
+        const body = {
+          action: currentAction,
+          id: document.getElementById('userId').value,
+          username: document.getElementById('uName').value,
+          password: document.getElementById('uPass').value,
+          email: document.getElementById('uEmail').value,
+          role: document.getElementById('uRole').value,
+          permissions: JSON.parse(document.getElementById('uPerms').value),
+          accessible_emails: JSON.parse(document.getElementById('uAccess').value),
+          disabled: document.getElementById('uDisabled').checked
+        };
+        const res = await fetch('/admin/users', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+        if(res.ok) { location.reload(); } else { const d = await res.json(); alert('保存错误: ' + d.message); }
+      };
+
+      async function deleteUser() {
+        if(confirm('确定要彻底注销并注销删除该用户账号吗？')) {
+          const body = { action: 'delete', id: document.getElementById('userId').value };
+          const res = await fetch('/admin/users', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+          if(res.ok) location.reload(); else alert('注销失败，权限受阻');
+        }
+      }
+    </script>
+  </body></html>`;
+}
+
+function generateLogPage(logs, session) {
+  const itemMap = {
+    'login': 'badge-read', 'logout': 'badge-read', 'update_system_config': 'badge-read',
+    'view_message': 'badge-unread', 'delete_message': 'badge-unread',
+    'create_user': 'badge-read', 'update_user': 'badge-read', 'delete_user': 'badge-read',
+    'access_denied': 'badge-read'
+  };
+
+  const rows = logs.map(l => {
+    const details = JSON.parse(l.details);
+    return `
+      <tr>
+        <td style="color:#64748b; font-size:12px;">${new Date(l.created_at).toLocaleString()}</td>
+        <td><span class="badge ${itemMap[l.action] || 'badge-read'}">${escapeHtml(l.action)}</span></td>
+        <td><strong>${escapeHtml(l.username)}</strong> (ID:${l.user_id})</td>
+        <td><small style="color:#475569;">${escapeHtml(details.description)}</small></td>
+        <td>${l.success ? '<span style="color:#22c55e;">成功</span>' : '<span style="color:#ef4444;font-weight:bold;">拒绝/失败</span>'}</td>
+        <td style="font-size:12px;color:#64748b;">${escapeHtml(l.ip)}</td>
+      </tr>
+    `;
+  }).join('');
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>集中审计日志</title>
+  <style>${getCommonCss()}</style></head>
+  <body>
+    <div class="container">
+      ${getHeaderNav(session)}
+      <h3 style="margin-bottom:12px; font-size:16px;">📋 实时系统底层全量审计日志面板</h3>
+      <div class="wrapper" style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>发生时间</th><th>行为类别</th><th>操作主体</th><th>行为详情描述</th><th>执行状态</th><th>客户端IP</th></tr></thead>
+          <tbody>${rows}</tbody>
         </table>
       </div>
     </div>
   </body></html>`;
 }
 
-function generateDetailPage(message) {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>查看邮件</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f8fafc; color: #1e293b; padding: 12px; }
-    .container { max-width: 900px; margin: 0 auto; }
-    .back-btn { display: inline-flex; align-items: center; padding: 8px 14px; background: white; border: 1px solid #e2e8f0; border-radius: 6px; color: #475569; text-decoration: none; font-size: 13px; margin-bottom: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
-    .card { background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); padding: 16px; margin-bottom: 16px; }
-    .subject { font-size: 18px; font-weight: 700; color: #0f172a; margin-bottom: 16px; line-height: 1.4; word-break: break-all; }
-    .meta-grid { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; font-size: 13px; border-bottom: 1px solid #f1f5f9; padding-bottom: 16px; margin-bottom: 16px; }
-    .meta-label { color: #64748b; font-weight: 500; min-width: 50px; }
-    .meta-value { color: #334155; word-break: break-all; }
-    .iframe-container { width: 100%; border: 1px solid #e2e8f0; border-radius: 8px; background: #fff; overflow-x: auto; -webkit-overflow-scrolling: touch; margin-top: 10px; }
-    iframe { width: 100%; min-height: 450px; border: none; display: block; }
-    .danger-zone { display: flex; justify-content: flex-end; }
-    .delete-btn { width: auto; padding: 10px 20px; background: #fee2e2; color: #ef4444; border: 1px solid #fca5a5; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px; }
-    
-    @media (max-width: 768px) {
-      .card { padding: 12px; }
-      .subject { font-size: 16px; }
-      .danger-zone { justify-content: center; }
-      .delete-btn { width: 100%; text-align: center; }
-    }
-  </style>
-  <script>
-    function deleteAndGoBack() {
-      if (confirm('确定要删除该邮件并返回收件箱吗？')) {
-        fetch('/delete/${message.id}', { method: 'POST' }).then(() => { window.location.href = '/'; });
-      }
-    }
-    function resizeIframe(obj) {
-      setTimeout(() => {
-        try {
-          obj.style.height = obj.contentWindow.document.documentElement.scrollHeight + 40 + 'px';
-        } catch(e) {
-          obj.style.height = '550px';
-        }
-      }, 250);
-    }
-  </script>
-  </head>
+function generateSettingsPage(config, session) {
+  const isReadonly = !session.role === 'superuser' && !session.permissions.includes('system:config:edit');
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>全局系统核心配置</title>
+  <style>${getCommonCss()}
+    .box { background:#fff; padding:24px; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.05); max-width:600px; margin:0 auto; }
+  </style></head>
   <body>
     <div class="container">
-      <a href="/" class="back-btn">← 返回收件箱</a>
-      <div class="card">
-        <div class="subject">${escapeHtml(message.subject || '(无主题)')}</div>
-        <div class="meta-grid">
-          <div class="meta-label">发件人</div><div class="meta-value">${escapeHtml(message.from_address)}</div>
-          <div class="meta-label">收件别名</div><div class="meta-value">${escapeHtml(message.mailbox_email)}</div>
-          <div class="meta-label">时间</div><div class="meta-value">${new Date(message.received_at).toLocaleString()}</div>
-        </div>
-        <div class="iframe-container">
-          <iframe src="/raw-html/${message.id}" sandbox="allow-popups allow-popups-to-escape-sandbox" onload="resizeIframe(this)"></iframe>
-        </div>
-      </div>
-      <div class="danger-zone">
-        <button class="delete-btn" onclick="deleteAndGoBack()">🗑️ 彻底删除邮件</button>
+      ${getHeaderNav(session)}
+      <div class="box">
+        <h3 style="margin-bottom:16px; font-size:16px;">⚙️ 全局核心控制设置策略面板</h3>
+        <form id="sForm">
+          <div class="g" style="margin-bottom:16px;">
+            <label style="display:block; font-weight:500; margin-bottom:6px;">允许接收邮件的域名后缀白名单（一行一个域名，留空不限制）</label>
+            <textarea id="domains" style="width:100%; height:100px; padding:10px; border:1px solid #cbd5e1; border-radius:6px;" ${isReadonly?'disabled':''}>${(config.allowed_domains || []).join('\n')}</textarea>
+          </div>
+          <div class="g" style="margin-bottom:20px;">
+            <label style="display:block; font-weight:500; margin-bottom:6px;">系统下发登录凭证 JWT 有效租期 (小时)</label>
+            <input type="number" id="expiry" value="${config.session_expiry_hours || 24}" style="width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;" ${isReadonly?'disabled':''}>
+          </div>
+          ${isReadonly ? '<p style="color:#ef4444;font-size:13px;">您当前持有的安全角色仅允许查阅，不开放修改权限。</p>' : '<button type="submit" class="btn">持久化应用并动态刷新热重载</button>'}
+        </form>
       </div>
     </div>
+    <script>
+      if(document.getElementById('sForm')) {
+        document.getElementById('sForm').onsubmit = async (e) => {
+          e.preventDefault();
+          const body = {
+            allowed_domains: document.getElementById('domains').value.split('\n').map(d=>d.trim()).filter(Boolean),
+            session_expiry_hours: parseInt(document.getElementById('expiry').value, 10)
+          };
+          const res = await fetch('/admin/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+          if(res.ok) alert('策略修改持久化成功，系统已执行无感全局配置重新加载！'); else alert('执行失败');
+        }
+      }
+    </script>
   </body></html>`;
+}
+
+// 提取公用的轻量全局响应式 CSS 架构
+function getCommonCss() {
+  return `
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background-color:#f8fafc; color:#1e293b; padding:16px; }
+    .container { max-width:1200px; margin:0 auto; }
+    .header { display:flex; justify-content:space-between; align-items:center; background:#fff; padding:14px 20px; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.05); margin-bottom:12px; }
+    .nav-brand { font-size:16px; font-weight:700; }
+    .nav-links { display:flex; gap:14px; align-items:center; }
+    .nav-item { color:#475569; text-decoration:none; font-size:14px; font-weight:500; }
+    .nav-item:hover { color:#0f172a; }
+    .user-badge { font-size:12px; color:#64748b; margin-bottom:16px; padding-left:4px; }
+    .wrapper { background:#fff; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
+    table { width:100%; border-collapse:collapse; font-size:14px; text-align:left; }
+    th { background:#f8fafc; padding:14px 16px; font-weight:600; color:#64748b; border-bottom:1px solid #e2e8f0; }
+    td { padding:14px 16px; border-bottom:1px solid #f1f5f9; color:#334155; vertical-align:middle; }
+    tr:hover { background-color:#f8fafc; }
+    tr.unread { background-color:#f0fdf4; }
+    .link { color:#2563eb; text-decoration:none; font-weight:500; }
+    .link:hover { text-decoration:underline; }
+    .badge { padding:4px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+    .badge-unread { background:#dcfce7; color:#166534; }
+    .badge-read { background:#f1f5f9; color:#64748b; }
+    .btn { padding:10px 16px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-size:14px; font-weight:500; cursor:pointer; }
+    .btn:hover { background:#1d4ed8; }
+    .logout-btn { padding:6px 12px; background:#fee2e2; color:#ef4444; text-decoration:none; border-radius:6px; font-size:13px; font-weight:600; }
+    .logout-btn:hover { background:#ef4444; color:#fff; }
+    .del-btn { padding:6px 12px; background:#fff; color:#ef4444; border:1px solid #fee2e2; border-radius:6px; cursor:pointer; font-size:12px; transition:0.2s; }
+    .del-btn:hover { background:#ef4444; color:#fff; }
+  `;
 }
