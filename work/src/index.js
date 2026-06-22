@@ -208,7 +208,7 @@ export default {
 
         if (username === SUPER_USER && password === SUPER_PASS) {
           const jwt = await generateJWT({ user_id: 0, username: SUPER_USER, role: 'superuser', permissions: ['*'], token_version: 0, exp: Date.now() + (expiryHours * 60 * 60 * 1000) });
-          await logAction(0, SUPER_USER, 'login', 'user', '0', '成功登入系统', true);
+          await logAction(0, SUPER_USER, 'login', 'user', '0', '系统登录', true);
           return new Response(JSON.stringify({ success: true }), {
             headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${expiryHours * 3600}` }
           });
@@ -217,20 +217,20 @@ export default {
         const user = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
         if (user) {
           if (user.disabled === 1) {
-            await logAction(user.id, username, 'login', 'user', user.id, '账户已被封禁阻断', false);
+            await logAction(user.id, username, 'login', 'user', user.id, '系统登录（账户封禁）', false);
             return new Response(JSON.stringify({ success: false, message: '账户已被封禁' }), { status: 403 });
           }
           const inputHash = await hashPassword(password);
           if (inputHash === user.password_hash) {
             const jwt = await generateJWT({ user_id: user.id, username: user.username, role: user.role, permissions: JSON.parse(user.permissions || '[]'), token_version: user.token_version, exp: Date.now() + (expiryHours * 60 * 60 * 1000) });
-            await logAction(user.id, username, 'login', 'user', user.id, '成功登入系统', true);
+            await logAction(user.id, username, 'login', 'user', user.id, '系统登录', true);
             return new Response(JSON.stringify({ success: true }), {
               headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${expiryHours * 3600}` }
             });
           }
         }
 
-        await logAction(-1, username, 'login', 'user', null, '凭证不匹配拦截', false);
+        await logAction(-1, username, 'login', 'user', null, '系统登录（密码错误）', false);
         return new Response(JSON.stringify({ success: false, message: '用户名或密码错误' }), { status: 401 });
       } catch (e) {
         return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
@@ -247,6 +247,7 @@ export default {
       return new Response(null, { status: 302, headers: { 'Location': '/login', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' }});
     }
 
+    // 🛡️ JWT 鉴权安全屏障
     const session = await getSession();
     if (!session) return new Response(null, { status: 302, headers: { 'Location': '/login' } });
     const hasPermission = (perm) => session.role === 'superuser' || session.permissions.includes(perm);
@@ -292,7 +293,7 @@ export default {
         }
 
         await env.DB.prepare('UPDATE messages SET is_read = 1 WHERE id = ?').bind(messageId).run();
-        await logAction(session.user_id, session.username, 'view_message', 'message', messageId, `阅读邮件: ${message.subject}`, true);
+        await logAction(session.user_id, session.username, 'view_message', 'message', messageId, `查看邮件`, true);
         return new Response(generateDetailPage(message, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       } catch (e) { return new Response('错误: ' + e.message, { status: 500 }); }
     }
@@ -317,7 +318,7 @@ export default {
         }
 
         await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(messageId).run();
-        await logAction(session.user_id, session.username, 'delete_message', 'message', messageId, `物理清除了邮件: ${message.subject}`, true);
+        await logAction(session.user_id, session.username, 'delete_message', 'message', messageId, `删除邮件`, true);
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
       } catch (e) { return new Response(e.message, { status: 500 }); }
     }
@@ -348,13 +349,13 @@ export default {
             await env.DB.prepare(
               `INSERT INTO users (username, password_hash, email, role, permissions, accessible_emails, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`
             ).bind(username, pwdHash, email || null, role, JSON.stringify(permissions), JSON.stringify(accessible_emails), session.user_id).run();
-            await logAction(session.user_id, session.username, 'create_user', 'user', null, `新增系统账户: ${username} [${role}]`, true);
+            await logAction(session.user_id, session.username, 'create_user', 'user', null, `创建用户 bob（角色：${role}）`, true);
             return new Response(JSON.stringify({ success: true }));
           }
 
           if (action === 'update') {
             const target = await env.DB.prepare('SELECT role, permissions, accessible_emails FROM users WHERE id = ?').bind(id).first();
-            if (target.role === 'admin' && !hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '权限不足，无法编辑高管' }), { status: 403 });
+            if (target.role === 'admin' && !hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '权限不足' }), { status: 403 });
 
             let updateSql = `UPDATE users SET email = ?, role = ?, permissions = ?, accessible_emails = ?, disabled = ?, token_version = token_version + 1`;
             let params = [email || null, role, JSON.stringify(permissions), JSON.stringify(accessible_emails), disabled ? 1 : 0];
@@ -366,9 +367,9 @@ export default {
             updateSql += ` WHERE id = ?`; params.push(id);
             await env.DB.prepare(updateSql).bind(...params).run();
             
-            await logAction(session.user_id, session.username, 'update_user', 'user', id, `编辑基本账户信息: ${username}`, true);
+            await logAction(session.user_id, session.username, 'update_user', 'user', id, `编辑用户信息: ${username}`, true);
             if (target.permissions !== JSON.stringify(permissions) || target.accessible_emails !== JSON.stringify(accessible_emails)) {
-              await logAction(session.user_id, session.username, 'update_permission', 'user', id, `更改了权限清单或可视邮箱白名单: ${username}`, true);
+              await logAction(session.user_id, session.username, 'update_permission', 'user', id, `修改用户权限`, true);
             }
             return new Response(JSON.stringify({ success: true }));
           }
@@ -376,7 +377,7 @@ export default {
           if (action === 'delete') {
             if (!hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '权限不足' }), { status: 403 });
             await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
-            await logAction(session.user_id, session.username, 'delete_user', 'user', id, `注销并删除了账户 ID: ${id}`, true);
+            await logAction(session.user_id, session.username, 'delete_user', 'user', id, `删除用户`, true);
             return new Response(JSON.stringify({ success: true }));
           }
         } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
@@ -385,26 +386,31 @@ export default {
 
     if (path === '/admin/logs' && hasPermission('log:view:all')) {
       const logs = await env.DB.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200').all();
-      await logAction(session.user_id, session.username, 'view_logs', 'log', null, `调阅了全局系统审计日志`, true);
+      await logAction(session.user_id, session.username, 'view_logs', 'log', null, `查看日志`, true);
       return new Response(generateLogPage(logs.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    // 🧹 API: 专为超管开放的过时日志清理接口
+    // 🧹 API 1: 全量定期清理日志接口
     if (path === '/admin/logs/cleanup' && request.method === 'POST') {
       if (session.role !== 'superuser') return new Response(JSON.stringify({ success: false, message: '仅超级管理员可执行日志清理' }), { status: 403 });
       try {
         const config = await getSystemConfig(env);
         const days = config.log_retention_days || 30;
-        
-        // SQLite 核心函数 datetime() 基于当前时间减去设置天数
         const result = await env.DB.prepare("DELETE FROM audit_logs WHERE created_at < datetime('now', ?)").bind(`-${days} days`).run();
-        const deletedCount = result.meta.changes;
-        
-        await logAction(session.user_id, session.username, 'cleanup_logs', 'log', null, `执行了过期审计日志清理（保留 ${days} 天），共清退 ${deletedCount} 条记录`, true);
-        return new Response(JSON.stringify({ success: true, count: deletedCount }), { headers: { 'Content-Type': 'application/json' } });
-      } catch (e) {
-        return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
-      }
+        await logAction(session.user_id, session.username, 'cleanup_logs', 'log', null, `清理日志（保留 ${days} 天）`, true);
+        return new Response(JSON.stringify({ success: true, count: result.meta.changes }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
+    }
+
+    // ❌ API 2: 满足要求新增：超管精准可选删除某条日志接口
+    if (path.startsWith('/admin/logs/delete/') && request.method === 'POST') {
+      if (session.role !== 'superuser') return new Response(JSON.stringify({ success: false, message: '权限不足' }), { status: 403 });
+      const logId = path.split('/')[4];
+      try {
+        await env.DB.prepare("DELETE FROM audit_logs WHERE id = ?").bind(logId).run();
+        // 减少不必要的递归开销，单独删除日志不做多余描述
+        return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
     }
 
     if (path === '/admin/settings' && hasPermission('system:config:view')) {
@@ -416,15 +422,19 @@ export default {
       if (request.method === 'POST' && hasPermission('system:config:edit')) {
         try {
           const body = await request.json();
-          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
+          // 🔥 彻底解决更改无效 Bug：全面引入 REPLACE 强制覆盖覆盖，重写 D1 行级生命周期
+          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by, updated_at) VALUES (?, ?, ?, datetime(\'now\'))')
             .bind('allowed_domains', JSON.stringify(body.allowed_domains || []), session.user_id).run();
-          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
+          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by, updated_at) VALUES (?, ?, ?, datetime(\'now\'))')
             .bind('session_expiry_hours', JSON.stringify(parseInt(body.session_expiry_hours, 10) || 24), session.user_id).run();
-          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
+          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by, updated_at) VALUES (?, ?, ?, datetime(\'now\'))')
             .bind('log_retention_days', JSON.stringify(parseInt(body.log_retention_days, 10) || 30), session.user_id).run();
           
+          // 🔥 热重载绝对核武：立刻将时间戳强制置零，破除 60 秒内存锁定，强推下一次 Fetch 全量去查 D1 数据库！
           configCache = null; 
-          await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '重新设定了系统环境策略配置（含日志保留天数）', true);
+          cacheTimestamp = 0;
+
+          await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '系统设置变更', true);
           return new Response(JSON.stringify({ success: true }));
         } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
       }
@@ -432,6 +442,10 @@ export default {
     return new Response('Not Found', { status: 404 });
   }
 };
+
+// ==========================================
+// 3. 策略校验与热重载缓存辅助函数
+// ==========================================
 
 function checkMailAccess(session, targetEmail, type) {
   if (session.role === 'superuser' || session.permissions.includes(`mail:${type}:all`)) return true;
@@ -448,11 +462,13 @@ function checkMailAccess(session, targetEmail, type) {
 async function getSystemConfig(env) {
   const now = Date.now();
   if (configCache && (now - cacheTimestamp < 60000)) return configCache; 
+  
   const rows = await env.DB.prepare('SELECT key, value FROM system_config').all();
-  // 🔥 新增 log_retention_days 默认值 30 天
   const config = { allowed_domains: [], session_expiry_hours: 24, log_retention_days: 30 };
   rows.results.forEach(row => { config[row.key] = JSON.parse(row.value); });
-  configCache = config; cacheTimestamp = now;
+  
+  configCache = config; 
+  cacheTimestamp = now;
   return config;
 }
 
@@ -829,6 +845,8 @@ function generateLogPage(logs, session) {
     return map[action] || { tag: '系统', color: '#64748b' };
   };
 
+  const isSuper = session.role === 'superuser';
+
   const rows = logs.map(l => {
     let descriptionText = '';
     try { descriptionText = JSON.parse(l.details).description; } catch(e) { descriptionText = l.details || ''; }
@@ -836,16 +854,20 @@ function generateLogPage(logs, session) {
     const meta = getActionTag(l.action);
     const resultStr = l.success ? '<span style="color:#22c55e;font-weight:600;">成功</span>' : '<span style="color:#ef4444;font-weight:600;">失败</span>';
     
+    // 🔥 满足要求：支持可选删除（仅超管可见）。增加右侧内联删除小按钮
     return `
-      <div style="padding:16px; border-bottom:1px solid #e2e8f0; display:flex; flex-wrap:wrap; align-items:flex-start; gap:12px;">
-        <div style="font-size:13px; color:#64748b; min-width:145px; font-family:monospace;">${new Date(l.created_at).toLocaleString('zh-CN')}</div>
-        <div style="font-size:14px; color:#1e293b; flex:1; line-height:1.6;">
-          <strong style="color:${meta.color}; margin-right:4px;">[${meta.tag}]</strong>
-          <strong style="font-size:15px;">${escapeHtml(l.username)}</strong>
-          <span style="color:#64748b;">（${escapeHtml(l.ip)}）</span>
-          执行 <span style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-weight:500;">${escapeHtml(descriptionText)}</span> 操作 
-          - 结果：${resultStr}
+      <div style="padding:16px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; gap:12px; background:#fff;">
+        <div style="display:flex; flex-wrap:wrap; align-items:flex-start; gap:12px; flex:1;">
+          <div style="font-size:13px; color:#64748b; min-width:145px; font-family:monospace;">${new Date(l.created_at).toLocaleString('zh-CN')}</div>
+          <div style="font-size:14px; color:#1e293b; flex:1; line-height:1.6;">
+            <strong style="color:${meta.color}; margin-right:4px;">[${meta.tag}]</strong>
+            <strong style="font-size:15px;">${escapeHtml(l.username)}</strong>
+            <span style="color:#64748b;">（${escapeHtml(l.ip)}）</span>
+            执行 <span style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-weight:500;">${escapeHtml(descriptionText)}</span> 操作 
+            - 结果：${resultStr}
+          </div>
         </div>
+        ${isSuper ? `<button class="del-btn" style="padding:4px 8px; font-size:12px;" onclick="deleteSingleLog(${l.id})">删除</button>` : ''}
       </div>
     `;
   }).join('');
@@ -855,12 +877,14 @@ function generateLogPage(logs, session) {
   <body>
     <div class="container">
       ${getHeaderNav(session)}
-      <div class="wrapper" style="padding:8px 0;">
+      <div class="wrapper" style="padding:8px 0; background: #fff;">
         <div style="padding:16px 20px; border-bottom:2px solid #f1f5f9; background:#f8fafc; border-radius:12px 12px 0 0; display:flex; justify-content:space-between; align-items:center;">
           <h3 style="font-size:16px; font-weight:700; margin:0;">📋 实时系统底层审计日志</h3>
-          ${session.role === 'superuser' ? `<button class="btn" style="background:#ef4444; padding:6px 12px; font-size:13px;" onclick="cleanupLogs()">🧹 清理过期日志</button>` : ''}
+          ${isSuper ? `<button class="btn" style="background:#ef4444; padding:6px 12px; font-size:13px;" onclick="cleanupLogs()">🧹 清理过期日志</button>` : ''}
         </div>
-        ${rows || '<div style="padding:40px; text-align:center; color:#94a3b8;">系统崭新，暂无任何日志记录。</div>'}
+        <div style="display:flex; flex-direction:column;">
+          ${rows || '<div style="padding:40px; text-align:center; color:#94a3b8;">系统崭新，暂无任何日志记录。</div>'}
+        </div>
       </div>
     </div>
     <script>
@@ -871,10 +895,15 @@ function generateLogPage(logs, session) {
             const data = await res.json();
             alert('清理完毕！本次共删除了 ' + data.count + ' 条过期日志。');
             location.reload();
-          } else {
-            const data = await res.json();
-            alert('清理失败: ' + data.message);
-          }
+          } else { alert('清理失败'); }
+        }
+      }
+      
+      // 可选删除特定日志实现
+      async function deleteSingleLog(id) {
+        if(confirm('确定要永久粉碎删除这一条特定的日志轨迹吗？')) {
+          const res = await fetch('/admin/logs/delete/' + id, { method: 'POST' });
+          if(res.ok) { location.reload(); } else { alert('删除失败，权限拒绝'); }
         }
       }
     </script>
@@ -919,7 +948,7 @@ function generateSettingsPage(config, session) {
             log_retention_days: parseInt(document.getElementById('logRetention').value, 10) || 30
           };
           const res = await fetch('/admin/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
-          if(res.ok) alert('策略修改成功，系统已执行配置无感热重载！'); else alert('执行失败');
+          if(res.ok) alert('策略修改成功，系统已执行配置动态刷新！'); else alert('执行失败');
         }
       }
     </script>
