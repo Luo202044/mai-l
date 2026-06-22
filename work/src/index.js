@@ -110,7 +110,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     
-    // 🔥 修复日志缺失 Bug 1：在此处提取真实的客户端 IP 和 UA
     const clientIp = request.headers.get('CF-Connecting-IP') || '127.0.0.1';
     const userAgent = request.headers.get('User-Agent') || 'Unknown';
 
@@ -141,12 +140,10 @@ export default {
       const header = { alg: 'HS256', typ: 'JWT' };
       const encodedHeader = base64UrlEncode(JSON.stringify(header));
       const encodedPayload = base64UrlEncode(JSON.stringify(payload));
-      
       const encoder = new TextEncoder();
       const key = await crypto.subtle.importKey('raw', encoder.encode(JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
       const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(`${encodedHeader}.${encodedPayload}`));
       const encodedSignature = base64UrlEncode(String.fromCharCode(...new Uint8Array(signature)));
-      
       return `${encodedHeader}.${encodedPayload}.${encodedSignature}`;
     };
 
@@ -155,14 +152,11 @@ export default {
         const parts = token.split('.');
         if (parts.length !== 3) return null;
         const [encodedHeader, encodedPayload, encodedSignature] = parts;
-        
         const encoder = new TextEncoder();
         const key = await crypto.subtle.importKey('raw', encoder.encode(JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
         const data = encoder.encode(`${encodedHeader}.${encodedPayload}`);
-        
         const sigBytes = new Uint8Array(base64UrlDecode(encodedSignature).split('').map(c => c.charCodeAt(0)));
         const valid = await crypto.subtle.verify('HMAC', key, sigBytes, data);
-        
         if (!valid) return null;
         const payload = JSON.parse(base64UrlDecode(encodedPayload));
         if (Date.now() > payload.exp) return null; 
@@ -175,10 +169,8 @@ export default {
     const getSession = async () => {
       const cookies = parseCookies(request.headers.get('Cookie') || '');
       if (!cookies.auth_token) return null;
-      
       const payload = await verifyJWT(cookies.auth_token);
       if (!payload) return null;
-
       if (payload.user_id === 0) return payload;
 
       const dbUser = await env.DB.prepare('SELECT token_version, disabled, permissions, accessible_emails FROM users WHERE id = ?')
@@ -186,30 +178,27 @@ export default {
       
       if (!dbUser || dbUser.disabled === 1 || dbUser.token_version !== payload.token_version) return null; 
 
-      payload.permissions = JSON.parse(dbUser.permissions);
-      payload.accessible_emails = JSON.parse(dbUser.accessible_emails);
+      payload.permissions = JSON.parse(dbUser.permissions || '[]');
+      payload.accessible_emails = JSON.parse(dbUser.accessible_emails || '[]');
       return payload;
     };
 
-    // 🔥 修复日志缺失 Bug 2：补充了 clientIp 和 userAgent 的绑定参数
-    const logAction = (userId, username, action, targetType, targetId, description, success) => {
-      ctx.waitUntil((async () => {
-        try {
-          await env.DB.prepare(
-            `INSERT INTO audit_logs (user_id, username, action, target_type, target_id, details, ip, user_agent, success)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).bind(userId, username, action, targetType, targetId ? String(targetId) : null, JSON.stringify({ description }), clientIp, userAgent, success ? 1 : 0).run();
-        } catch (e) {
-          console.error('写入审计日志失败:', e);
-        }
-      })());
+    // 🔥 修复日志丢失的核心：改为强同步阻塞写入 (await)
+    const logAction = async (userId, username, action, targetType, targetId, description, success) => {
+      try {
+        await env.DB.prepare(
+          `INSERT INTO audit_logs (user_id, username, action, target_type, target_id, details, ip, user_agent, success)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(userId, username, action, targetType, targetId ? String(targetId) : null, JSON.stringify({ description }), clientIp, userAgent, success ? 1 : 0).run();
+      } catch (e) {
+        console.error('写入审计日志失败:', e);
+      }
     };
 
     // ------------------------------------------
     // ⚙️ 路由处理
     // ------------------------------------------
     
-    // API: 登录提交
     if (path === '/api/login' && request.method === 'POST') {
       try {
         const formData = await request.formData();
@@ -220,7 +209,7 @@ export default {
 
         if (username === SUPER_USER && password === SUPER_PASS) {
           const jwt = await generateJWT({ user_id: 0, username: SUPER_USER, role: 'superuser', permissions: ['*'], token_version: 0, exp: Date.now() + (expiryHours * 60 * 60 * 1000) });
-          logAction(0, SUPER_USER, 'login', 'user', '0', '成功登入系统', true);
+          await logAction(0, SUPER_USER, 'login', 'user', '0', '成功登入系统', true);
           return new Response(JSON.stringify({ success: true }), {
             headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${expiryHours * 3600}` }
           });
@@ -229,20 +218,20 @@ export default {
         const user = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
         if (user) {
           if (user.disabled === 1) {
-            logAction(user.id, username, 'login', 'user', user.id, '账户已被封禁阻断', false);
+            await logAction(user.id, username, 'login', 'user', user.id, '账户已被封禁阻断', false);
             return new Response(JSON.stringify({ success: false, message: '账户已被封禁' }), { status: 403 });
           }
           const inputHash = await hashPassword(password);
           if (inputHash === user.password_hash) {
-            const jwt = await generateJWT({ user_id: user.id, username: user.username, role: user.role, permissions: JSON.parse(user.permissions), token_version: user.token_version, exp: Date.now() + (expiryHours * 60 * 60 * 1000) });
-            logAction(user.id, username, 'login', 'user', user.id, '成功登入系统', true);
+            const jwt = await generateJWT({ user_id: user.id, username: user.username, role: user.role, permissions: JSON.parse(user.permissions || '[]'), token_version: user.token_version, exp: Date.now() + (expiryHours * 60 * 60 * 1000) });
+            await logAction(user.id, username, 'login', 'user', user.id, '成功登入系统', true);
             return new Response(JSON.stringify({ success: true }), {
               headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${expiryHours * 3600}` }
             });
           }
         }
 
-        logAction(-1, username, 'login', 'user', null, '凭证不匹配拦截', false);
+        await logAction(-1, username, 'login', 'user', null, '凭证不匹配拦截', false);
         return new Response(JSON.stringify({ success: false, message: '用户名或密码错误' }), { status: 401 });
       } catch (e) {
         return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
@@ -255,7 +244,7 @@ export default {
 
     if (path === '/logout') {
       const session = await getSession();
-      if (session) logAction(session.user_id, session.username, 'logout', 'user', session.user_id, '注销并退出系统', true);
+      if (session) await logAction(session.user_id, session.username, 'logout', 'user', session.user_id, '注销并退出系统', true);
       return new Response(null, { status: 302, headers: { 'Location': '/login', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' }});
     }
 
@@ -287,7 +276,6 @@ export default {
         querySql += ` ORDER BY m.received_at DESC LIMIT 100`;
         const stmt = env.DB.prepare(querySql);
         const messages = await (bindParams.length > 0 ? stmt.bind(...bindParams) : stmt).all();
-        // 首页仅加载，不记录日志防止日志库污染膨胀
         return new Response(generateListPage(messages.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       } catch (e) {
         return new Response('系统错误: ' + e.message, { status: 500 });
@@ -301,12 +289,12 @@ export default {
         if (!message) return new Response('邮件不存在', { status: 404 });
 
         if (!checkMailAccess(session, message.mailbox_email, 'view')) {
-          logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权尝试查看他人邮件`, false);
+          await logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权尝试查看他人邮件`, false);
           return new Response('无权查看该邮件', { status: 403 });
         }
 
         await env.DB.prepare('UPDATE messages SET is_read = 1 WHERE id = ?').bind(messageId).run();
-        logAction(session.user_id, session.username, 'view_message', 'message', messageId, `阅读邮件: ${message.subject}`, true);
+        await logAction(session.user_id, session.username, 'view_message', 'message', messageId, `阅读邮件: ${message.subject}`, true);
         return new Response(generateDetailPage(message, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       } catch (e) { return new Response('错误: ' + e.message, { status: 500 }); }
     }
@@ -326,12 +314,12 @@ export default {
         if (!message) return new Response('邮件未找到', { status: 404 });
 
         if (!checkMailAccess(session, message.email, 'delete')) {
-          logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权尝试删除他人邮件`, false);
+          await logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权尝试删除他人邮件`, false);
           return new Response('无操作权限', { status: 403 });
         }
 
         await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(messageId).run();
-        logAction(session.user_id, session.username, 'delete_message', 'message', messageId, `物理清除了邮件: ${message.subject}`, true);
+        await logAction(session.user_id, session.username, 'delete_message', 'message', messageId, `物理清除了邮件: ${message.subject}`, true);
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
       } catch (e) { return new Response(e.message, { status: 500 }); }
     }
@@ -341,7 +329,14 @@ export default {
 
       if (request.method === 'GET') {
         const users = await env.DB.prepare('SELECT id, username, email, role, permissions, accessible_emails, disabled, created_at FROM users ORDER BY id DESC').all();
-        return new Response(generateUserPage(users.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        // 🔥 提前安全解析 JSON，防止前端可视化按钮卡死
+        const parsedUsers = users.results.map(u => {
+          let perms = [], emails = [];
+          try { perms = JSON.parse(u.permissions || '[]'); } catch (e) {}
+          try { emails = JSON.parse(u.accessible_emails || '[]'); } catch (e) {}
+          return { ...u, permissions: perms, accessible_emails: emails };
+        });
+        return new Response(generateUserPage(parsedUsers, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       }
 
       if (request.method === 'POST') {
@@ -356,7 +351,7 @@ export default {
             await env.DB.prepare(
               `INSERT INTO users (username, password_hash, email, role, permissions, accessible_emails, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`
             ).bind(username, pwdHash, email || null, role, JSON.stringify(permissions), JSON.stringify(accessible_emails), session.user_id).run();
-            logAction(session.user_id, session.username, 'create_user', 'user', null, `新增系统账户: ${username} [${role}]`, true);
+            await logAction(session.user_id, session.username, 'create_user', 'user', null, `新增系统账户: ${username} [${role}]`, true);
             return new Response(JSON.stringify({ success: true }));
           }
 
@@ -374,10 +369,9 @@ export default {
             updateSql += ` WHERE id = ?`; params.push(id);
             await env.DB.prepare(updateSql).bind(...params).run();
             
-            // 🔥 精准记录：是改了信息还是改了权限？
-            logAction(session.user_id, session.username, 'update_user', 'user', id, `编辑基础账户信息: ${username}`, true);
+            await logAction(session.user_id, session.username, 'update_user', 'user', id, `编辑基本账户信息: ${username}`, true);
             if (target.permissions !== JSON.stringify(permissions) || target.accessible_emails !== JSON.stringify(accessible_emails)) {
-              logAction(session.user_id, session.username, 'update_permission', 'user', id, `更改了权限清单或可视邮箱白名单: ${username}`, true);
+              await logAction(session.user_id, session.username, 'update_permission', 'user', id, `更改了权限清单或可视邮箱白名单: ${username}`, true);
             }
             return new Response(JSON.stringify({ success: true }));
           }
@@ -385,7 +379,7 @@ export default {
           if (action === 'delete') {
             if (!hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '权限不足' }), { status: 403 });
             await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
-            logAction(session.user_id, session.username, 'delete_user', 'user', id, `注销并删除了账户 ID: ${id}`, true);
+            await logAction(session.user_id, session.username, 'delete_user', 'user', id, `注销并删除了账户 ID: ${id}`, true);
             return new Response(JSON.stringify({ success: true }));
           }
         } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
@@ -394,7 +388,7 @@ export default {
 
     if (path === '/admin/logs' && hasPermission('log:view:all')) {
       const logs = await env.DB.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200').all();
-      logAction(session.user_id, session.username, 'view_logs', 'log', null, `调阅了全局系统审计日志`, true);
+      await logAction(session.user_id, session.username, 'view_logs', 'log', null, `调阅了全局系统审计日志`, true);
       return new Response(generateLogPage(logs.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
@@ -412,7 +406,7 @@ export default {
           await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
             .bind('session_expiry_hours', JSON.stringify(parseInt(body.session_expiry_hours, 10) || 24), session.user_id).run();
           configCache = null; 
-          logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '重新设定了系统环境策略配置', true);
+          await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '重新设定了系统环境策略配置', true);
           return new Response(JSON.stringify({ success: true }));
         } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
       }
@@ -458,6 +452,10 @@ function parseCookies(header) {
   }
   return cookies;
 }
+
+// ==========================================
+// 4. 🎨 全局多端高度自适应 UI 页面渲染模板
+// ==========================================
 
 function getHeaderNav(session) {
   const hasUserManage = session.role === 'superuser' || session.permissions.includes('user:manage:restricted') || session.permissions.includes('user:manage:all');
@@ -579,7 +577,7 @@ function generateDetailPage(message, session) {
         <div class="grid">
           <div class="lbl">发件人</div><div>${escapeHtml(message.from_address)}</div>
           <div class="lbl">收件人</div><div>${escapeHtml(message.mailbox_email)}</div>
-          <div class="lbl">到达时间</div><div>${new Date(message.received_at).toLocaleString()}</div>
+          <div class="lbl">到达时间</div><div>${new Date(message.received_at).toLocaleString('zh-CN')}</div>
         </div>
         <iframe src="/raw-html/${message.id}" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>
       </div>
@@ -602,6 +600,7 @@ function generateUserPage(users, session) {
     { key: 'system:config:edit', label: '修改全局系统设置', desc: '允许改写动态热重载系统配置' }
   ];
 
+  // 🔥 修复按钮无法点击的终极方案：不在 HTML 标签里直接传 JSON，而是传 ID，然后在浏览器内存里找对象
   const rows = users.map(u => `
     <tr>
       <td data-label="用户名" style="font-weight:600; color:#0f172a;">${escapeHtml(u.username)}</td>
@@ -610,7 +609,7 @@ function generateUserPage(users, session) {
       <td data-label="状态">${u.disabled ? '<span style="color:#ef4444;font-weight:500;">❌ 封禁</span>' : '<span style="color:#22c55e;font-weight:500;">✅ 正常</span>'}</td>
       <td data-label="管理">
         <button class="btn" style="padding:6px 12px; background:#f1f5f9; color:#0f172a; font-size:13px; border:1px solid #cbd5e1;" 
-                onclick="editUser(${JSON.stringify(u).replace(/"/g, '&quot;')})">可视化配置</button>
+                onclick="editUserById(${u.id})">可视化配置</button>
       </td>
     </tr>
   `).join('');
@@ -698,8 +697,16 @@ function generateUserPage(users, session) {
         </table>
       </div>
     </div>
+    
     <script>
+      const USERS_DATA = ${JSON.stringify(users)};
       let currentAction = 'create';
+      
+      function editUserById(id) {
+        const u = USERS_DATA.find(x => x.id === id);
+        if(u) editUser(u);
+      }
+
       function applyTemplate(role) {
         const checkboxes = document.querySelectorAll('input[name="perms"]');
         checkboxes.forEach(cb => cb.checked = false);
@@ -714,6 +721,7 @@ function generateUserPage(users, session) {
           });
         }
       }
+      
       function showCreateForm() {
         currentAction = 'create';
         document.getElementById('fTitle').innerText = '新增策略授权账号';
@@ -730,6 +738,7 @@ function generateUserPage(users, session) {
         document.getElementById('formCard').style.display = 'block';
         document.getElementById('formCard').scrollIntoView({ behavior: 'smooth' });
       }
+      
       function editUser(u) {
         currentAction = 'update';
         document.getElementById('fTitle').innerText = '修改账户授权 - ' + u.username;
@@ -740,14 +749,19 @@ function generateUserPage(users, session) {
         document.getElementById('uEmail').value = u.email || '';
         document.getElementById('uRole').value = u.role;
         document.getElementById('uDisabled').checked = u.disabled === 1;
+        
         const checkboxes = document.querySelectorAll('input[name="perms"]');
-        checkboxes.forEach(cb => { cb.checked = u.permissions.includes(cb.value); });
+        checkboxes.forEach(cb => { cb.checked = (u.permissions || []).includes(cb.value); });
+        
         document.getElementById('uAccess').value = (u.accessible_emails || []).join('\\n');
+        
         document.getElementById('delBtn').style.display = 'inline-block';
         document.getElementById('formCard').style.display = 'block';
         document.getElementById('formCard').scrollIntoView({ behavior: 'smooth' });
       }
+      
       function hideForm() { document.getElementById('formCard').style.display = 'none'; }
+      
       document.getElementById('uForm').onsubmit = async (e) => {
         e.preventDefault();
         const checkedPerms = Array.from(document.querySelectorAll('input[name="perms"]:checked')).map(cb => cb.value);
@@ -766,6 +780,7 @@ function generateUserPage(users, session) {
         const res = await fetch('/admin/users', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
         if(res.ok) { location.reload(); } else { const d = await res.json(); alert('配置同步失败: ' + d.message); }
       };
+      
       async function deleteUser() {
         if(confirm('确定要注销删除该用户账户吗？')) {
           const body = { action: 'delete', id: document.getElementById('userId').value };
@@ -778,7 +793,7 @@ function generateUserPage(users, session) {
 }
 
 function generateLogPage(logs, session) {
-  // 🔥 根据用户的精确需求，匹配操作分类与 UI 高亮颜色
+  // 🔥 精确适配：高亮操作分类与 UI 颜色标签
   const getActionTag = (action) => {
     const map = {
       'login': { tag: '系统', color: '#6366f1' },
@@ -793,15 +808,22 @@ function generateLogPage(logs, session) {
       'view_logs': { tag: '日志', color: '#10b981' },
       'access_denied': { tag: '安全', color: '#ef4444' }
     };
-    return map[action] || { tag: '其他', color: '#64748b' };
+    return map[action] || { tag: '系统', color: '#64748b' };
   };
 
   const rows = logs.map(l => {
-    const details = JSON.parse(l.details);
+    // 🔥 容错解析机制：防止旧版的非 JSON 日志搞崩页面
+    let descriptionText = '';
+    try {
+      descriptionText = JSON.parse(l.details).description;
+    } catch(e) {
+      descriptionText = l.details || '';
+    }
+
     const meta = getActionTag(l.action);
     const resultStr = l.success ? '<span style="color:#22c55e;font-weight:600;">成功</span>' : '<span style="color:#ef4444;font-weight:600;">失败</span>';
     
-    // 完全符合： {标签} {用户名}（{ip}）执行 xxxxx 操作 - 结果 ：{} 
+    // 🔥 精准对齐格式： [标签] {用户名}（{ip}）执行 xxxxx 操作 - 结果 ：{} 
     return `
       <div style="padding:16px; border-bottom:1px solid #e2e8f0; display:flex; flex-wrap:wrap; align-items:flex-start; gap:12px;">
         <div style="font-size:13px; color:#64748b; min-width:145px; font-family:monospace;">${new Date(l.created_at).toLocaleString('zh-CN')}</div>
@@ -809,7 +831,7 @@ function generateLogPage(logs, session) {
           <strong style="color:${meta.color}; margin-right:4px;">[${meta.tag}]</strong>
           <strong style="font-size:15px;">${escapeHtml(l.username)}</strong>
           <span style="color:#64748b;">（${escapeHtml(l.ip)}）</span>
-          执行 <span style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-weight:500;">${escapeHtml(details.description)}</span> 操作 
+          执行 <span style="background:#f1f5f9; padding:2px 6px; border-radius:4px; font-weight:500;">${escapeHtml(descriptionText)}</span> 操作 
           - 结果：${resultStr}
         </div>
       </div>
