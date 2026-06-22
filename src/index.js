@@ -183,7 +183,6 @@ export default {
       return payload;
     };
 
-    // 🔥 修复日志丢失的核心：改为强同步阻塞写入 (await)
     const logAction = async (userId, username, action, targetType, targetId, description, success) => {
       try {
         await env.DB.prepare(
@@ -248,7 +247,6 @@ export default {
       return new Response(null, { status: 302, headers: { 'Location': '/login', 'Set-Cookie': 'auth_token=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0' }});
     }
 
-    // 🛡️ JWT 鉴权
     const session = await getSession();
     if (!session) return new Response(null, { status: 302, headers: { 'Location': '/login' } });
     const hasPermission = (perm) => session.role === 'superuser' || session.permissions.includes(perm);
@@ -329,7 +327,6 @@ export default {
 
       if (request.method === 'GET') {
         const users = await env.DB.prepare('SELECT id, username, email, role, permissions, accessible_emails, disabled, created_at FROM users ORDER BY id DESC').all();
-        // 🔥 提前安全解析 JSON，防止前端可视化按钮卡死
         const parsedUsers = users.results.map(u => {
           let perms = [], emails = [];
           try { perms = JSON.parse(u.permissions || '[]'); } catch (e) {}
@@ -392,6 +389,24 @@ export default {
       return new Response(generateLogPage(logs.results, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
+    // 🧹 API: 专为超管开放的过时日志清理接口
+    if (path === '/admin/logs/cleanup' && request.method === 'POST') {
+      if (session.role !== 'superuser') return new Response(JSON.stringify({ success: false, message: '仅超级管理员可执行日志清理' }), { status: 403 });
+      try {
+        const config = await getSystemConfig(env);
+        const days = config.log_retention_days || 30;
+        
+        // SQLite 核心函数 datetime() 基于当前时间减去设置天数
+        const result = await env.DB.prepare("DELETE FROM audit_logs WHERE created_at < datetime('now', ?)").bind(`-${days} days`).run();
+        const deletedCount = result.meta.changes;
+        
+        await logAction(session.user_id, session.username, 'cleanup_logs', 'log', null, `执行了过期审计日志清理（保留 ${days} 天），共清退 ${deletedCount} 条记录`, true);
+        return new Response(JSON.stringify({ success: true, count: deletedCount }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) {
+        return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 });
+      }
+    }
+
     if (path === '/admin/settings' && hasPermission('system:config:view')) {
       if (request.method === 'GET') {
         const config = await getSystemConfig(env);
@@ -405,8 +420,11 @@ export default {
             .bind('allowed_domains', JSON.stringify(body.allowed_domains || []), session.user_id).run();
           await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
             .bind('session_expiry_hours', JSON.stringify(parseInt(body.session_expiry_hours, 10) || 24), session.user_id).run();
+          await env.DB.prepare('INSERT OR REPLACE INTO system_config (key, value, updated_by) VALUES (?, ?, ?)')
+            .bind('log_retention_days', JSON.stringify(parseInt(body.log_retention_days, 10) || 30), session.user_id).run();
+          
           configCache = null; 
-          await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '重新设定了系统环境策略配置', true);
+          await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '重新设定了系统环境策略配置（含日志保留天数）', true);
           return new Response(JSON.stringify({ success: true }));
         } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
       }
@@ -431,7 +449,8 @@ async function getSystemConfig(env) {
   const now = Date.now();
   if (configCache && (now - cacheTimestamp < 60000)) return configCache; 
   const rows = await env.DB.prepare('SELECT key, value FROM system_config').all();
-  const config = { allowed_domains: [], session_expiry_hours: 24 };
+  // 🔥 新增 log_retention_days 默认值 30 天
+  const config = { allowed_domains: [], session_expiry_hours: 24, log_retention_days: 30 };
   rows.results.forEach(row => { config[row.key] = JSON.parse(row.value); });
   configCache = config; cacheTimestamp = now;
   return config;
@@ -600,7 +619,6 @@ function generateUserPage(users, session) {
     { key: 'system:config:edit', label: '修改全局系统设置', desc: '允许改写动态热重载系统配置' }
   ];
 
-  // 🔥 修复按钮无法点击的终极方案：不在 HTML 标签里直接传 JSON，而是传 ID，然后在浏览器内存里找对象
   const rows = users.map(u => `
     <tr>
       <td data-label="用户名" style="font-weight:600; color:#0f172a;">${escapeHtml(u.username)}</td>
@@ -793,7 +811,6 @@ function generateUserPage(users, session) {
 }
 
 function generateLogPage(logs, session) {
-  // 🔥 精确适配：高亮操作分类与 UI 颜色标签
   const getActionTag = (action) => {
     const map = {
       'login': { tag: '系统', color: '#6366f1' },
@@ -806,24 +823,19 @@ function generateLogPage(logs, session) {
       'delete_user': { tag: '管理', color: '#f59e0b' },
       'update_permission': { tag: '权限', color: '#8b5cf6' },
       'view_logs': { tag: '日志', color: '#10b981' },
+      'cleanup_logs': { tag: '日志', color: '#10b981' },
       'access_denied': { tag: '安全', color: '#ef4444' }
     };
     return map[action] || { tag: '系统', color: '#64748b' };
   };
 
   const rows = logs.map(l => {
-    // 🔥 容错解析机制：防止旧版的非 JSON 日志搞崩页面
     let descriptionText = '';
-    try {
-      descriptionText = JSON.parse(l.details).description;
-    } catch(e) {
-      descriptionText = l.details || '';
-    }
+    try { descriptionText = JSON.parse(l.details).description; } catch(e) { descriptionText = l.details || ''; }
 
     const meta = getActionTag(l.action);
     const resultStr = l.success ? '<span style="color:#22c55e;font-weight:600;">成功</span>' : '<span style="color:#ef4444;font-weight:600;">失败</span>';
     
-    // 🔥 精准对齐格式： [标签] {用户名}（{ip}）执行 xxxxx 操作 - 结果 ：{} 
     return `
       <div style="padding:16px; border-bottom:1px solid #e2e8f0; display:flex; flex-wrap:wrap; align-items:flex-start; gap:12px;">
         <div style="font-size:13px; color:#64748b; min-width:145px; font-family:monospace;">${new Date(l.created_at).toLocaleString('zh-CN')}</div>
@@ -844,12 +856,28 @@ function generateLogPage(logs, session) {
     <div class="container">
       ${getHeaderNav(session)}
       <div class="wrapper" style="padding:8px 0;">
-        <div style="padding:16px 20px; border-bottom:2px solid #f1f5f9; background:#f8fafc; border-radius:12px 12px 0 0;">
+        <div style="padding:16px 20px; border-bottom:2px solid #f1f5f9; background:#f8fafc; border-radius:12px 12px 0 0; display:flex; justify-content:space-between; align-items:center;">
           <h3 style="font-size:16px; font-weight:700; margin:0;">📋 实时系统底层审计日志</h3>
+          ${session.role === 'superuser' ? `<button class="btn" style="background:#ef4444; padding:6px 12px; font-size:13px;" onclick="cleanupLogs()">🧹 清理过期日志</button>` : ''}
         </div>
         ${rows || '<div style="padding:40px; text-align:center; color:#94a3b8;">系统崭新，暂无任何日志记录。</div>'}
       </div>
     </div>
+    <script>
+      async function cleanupLogs() {
+        if(confirm('确定要清理过期的审计日志吗？\\n\\n系统将根据全局配置设定的天数进行物理粉碎删除，该操作不可逆转！')) {
+          const res = await fetch('/admin/logs/cleanup', { method: 'POST' });
+          if(res.ok) {
+            const data = await res.json();
+            alert('清理完毕！本次共删除了 ' + data.count + ' 条过期日志。');
+            location.reload();
+          } else {
+            const data = await res.json();
+            alert('清理失败: ' + data.message);
+          }
+        }
+      }
+    </script>
   </body></html>`;
 }
 
@@ -869,11 +897,15 @@ function generateSettingsPage(config, session) {
             <label style="display:block; font-weight:500; margin-bottom:6px;">允许接收邮件的域名后缀白名单（一行一个，留空不限制）</label>
             <textarea id="domains" style="width:100%; height:100px; padding:10px; border:1px solid #cbd5e1; border-radius:6px;" ${isReadonly?'disabled':''}>${(config.allowed_domains || []).join('\n')}</textarea>
           </div>
-          <div class="g" style="margin-bottom:20px;">
+          <div class="g" style="margin-bottom:16px;">
             <label style="display:block; font-weight:500; margin-bottom:6px;">登录凭证 JWT 有效租期 (小时)</label>
             <input type="number" id="expiry" value="${config.session_expiry_hours || 24}" style="width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;" ${isReadonly?'disabled':''}>
           </div>
-          ${isReadonly ? '<p style="color:#ef4444;font-size:13px;">您当前持有的安全角色仅允许查阅，无修改权限。</p>' : '<button type="submit" class="btn">持久化应用并刷新热重载</button>'}
+          <div class="g" style="margin-bottom:24px;">
+            <label style="display:block; font-weight:500; margin-bottom:6px;">底层审计日志最大保留期限 (天)</label>
+            <input type="number" id="logRetention" value="${config.log_retention_days || 30}" min="1" max="365" style="width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:6px;" ${isReadonly?'disabled':''}>
+          </div>
+          ${isReadonly ? '<p style="color:#ef4444;font-size:13px;">您当前持有的安全角色仅允许查阅，无修改权限。</p>' : '<button type="submit" class="btn" style="width:100%;">持久化应用并刷新热重载</button>'}
         </form>
       </div>
     </div>
@@ -883,10 +915,11 @@ function generateSettingsPage(config, session) {
           e.preventDefault();
           const body = {
             allowed_domains: document.getElementById('domains').value.split('\n').map(d=>d.trim()).filter(Boolean),
-            session_expiry_hours: parseInt(document.getElementById('expiry').value, 10)
+            session_expiry_hours: parseInt(document.getElementById('expiry').value, 10),
+            log_retention_days: parseInt(document.getElementById('logRetention').value, 10) || 30
           };
           const res = await fetch('/admin/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
-          if(res.ok) alert('修改成功，系统已执行配置无感热重载！'); else alert('执行失败');
+          if(res.ok) alert('策略修改成功，系统已执行配置无感热重载！'); else alert('执行失败');
         }
       }
     </script>
