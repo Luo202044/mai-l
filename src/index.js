@@ -183,7 +183,6 @@ export default {
       if (!session) return new Response(null, { status: 401 });
       
       if (session.role === 'superuser') return new Response(JSON.stringify({message: '超管账户不支持在此修改密码'}), {status: 403});
-      // 账户级别的权限控制
       if (!session.permissions.includes('user:self:password')) return new Response(JSON.stringify({message: '您的账户没有修改密码的权限'}), {status: 403});
 
       const { oldPwd, newPwd } = await request.json();
@@ -320,7 +319,7 @@ export default {
         if (!message) return new Response('邮件不存在', { status: 404 });
         if (!checkMailAccess(session, message.mailbox_email, 'view')) return new Response('无权查看该邮件', { status: 403 });
         await env.DB.prepare('UPDATE messages SET is_read = 1 WHERE id = ?').bind(messageId).run();
-        await logAction(session.user_id, session.username, 'view_message', 'message', messageId, `查看邮件主题: ${message.subject}`, true);
+        await logAction(session.user_id, session.username, 'view_message', 'message', messageId, `查看邮件: ${message.subject}`, true);
         return new Response(generateDetailPage(message, session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       } catch (e) { return new Response('错误: ' + e.message, { status: 500 }); }
     }
@@ -347,13 +346,17 @@ export default {
       return new Response(JSON.stringify({ success: true, count: authorizedIds.length }));
     }
 
-    // --- 获取指定用户专属操作日志 ---
-    // 修复：同时拉取“该用户做的操作”以及“管理员对该用户做的操作”
-    if (path.startsWith('/api/users/') && path.endsWith('/logs') && request.method === 'GET') {
-      if (!hasPermission('user:manage:restricted') && !hasPermission('user:manage:all')) return new Response('Forbidden', {status: 403});
-      const targetId = path.split('/')[3];
-      const logs = await env.DB.prepare(`SELECT * FROM audit_logs WHERE user_id = ? OR (target_type = 'user' AND target_id = ?) ORDER BY created_at DESC LIMIT 50`).bind(targetId, targetId).all();
-      return new Response(JSON.stringify({logs: logs.results}), {headers:{'Content-Type':'application/json'}});
+    // --- API: 获取指定用户的审计日志 (已补齐修复，不再404) ---
+    const logMatch = path.match(/^\/api\/users\/(\d+)\/logs$/);
+    if (logMatch && request.method === 'GET') {
+      if (!hasPermission('user:manage:restricted') && !hasPermission('user:manage:all')) return new Response(JSON.stringify({error: 'Forbidden'}), {status: 403});
+      try {
+        const targetId = logMatch[1];
+        const logs = await env.DB.prepare(`SELECT * FROM audit_logs WHERE user_id = ? OR (target_type = 'user' AND target_id = ?) ORDER BY created_at DESC LIMIT 50`).bind(targetId, targetId).all();
+        return new Response(JSON.stringify({logs: logs.results}), {headers:{'Content-Type':'application/json'}});
+      } catch(e) {
+        return new Response(JSON.stringify({error: e.message}), {status: 500});
+      }
     }
 
     // --- 用户管理 ---
@@ -472,7 +475,6 @@ export default {
       if (request.method === 'POST' && hasPermission('system:config:edit')) {
         try {
           const body = await request.json();
-          // 无延时即刻写入 KV
           if (env.CONFIG_KV) {
             const newConfig = {
               log_retention_days: parseInt(body.log_retention_days, 10) || 30,
@@ -485,7 +487,7 @@ export default {
             };
             await env.CONFIG_KV.put('system_config', JSON.stringify(newConfig));
           }
-          await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '修改了系统配置', true);
+          await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '修改了系统全局配置', true);
           return new Response(JSON.stringify({ success: true }));
         } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
       }
@@ -507,7 +509,6 @@ function checkMailAccess(session, targetEmail, type) {
   return false;
 }
 
-// 废弃旧的 SQL 内存缓存，全量直连 KV
 async function getSystemConfig(env) {
   const defaultConfig = { log_retention_days: 30, session_expiry_hours: 24, max_login_failures: 5, failure_window_hours: 1, lockout_hours: 2, ip_blacklist: "", allowed_domains: [] };
   if (!env.CONFIG_KV) return defaultConfig;
@@ -527,7 +528,7 @@ function parseCookies(header) {
 }
 
 // ==========================================
-// 4. 🎨 凡戴克棕 + 浅卡其色 UI 系统 (文案已标准化)
+// 4. 🎨 凡戴克棕 + 浅卡其色 UI 系统
 // ==========================================
 function getHeaderNav(session) {
   const hasUserManage = session.role === 'superuser' || session.permissions.includes('user:manage:restricted') || session.permissions.includes('user:manage:all');
@@ -576,7 +577,7 @@ function generateProfilePage(session) {
       <div class="box">
         <h3 style="margin-bottom:16px; color:var(--primary);">🔒 修改密码</h3>
         ${isSuper ? '<p style="color:#ef4444; background:#fee2e2; padding:10px; border-radius:6px;">超管账户不支持在此页面修改密码。</p>' : ''}
-        ${!isSuper && !canChange ? '<p style="color:#ef4444; background:#fee2e2; padding:10px; border-radius:6px;">您的账户没有修改密码的权限。</p>' : ''}
+        ${!isSuper && !canChange ? '<p style="color:#ef4444; background:#fee2e2; padding:10px; border-radius:6px;">您的账户没有修改密码的权限，请联系管理员分配权限。</p>' : ''}
         
         ${canChange ? `
         <form id="pwdForm">
@@ -642,6 +643,7 @@ function generateLoginPage() {
 }
 
 function generateListPage(messages, session, page, totalPages) {
+  // 🔥 新增：在邮件列表增加单独的“查看”按钮，优化右侧操作组的移动端布局
   const rows = messages.map(msg => `
     <tr>
       <td data-label="勾选"><input type="checkbox" class="batch-cb" value="${msg.id}"></td>
@@ -649,15 +651,24 @@ function generateListPage(messages, session, page, totalPages) {
       <td data-label="发件人">${escapeHtml(msg.from_address)}</td>
       <td data-label="邮件主题"><a class="link" href="/view/${msg.id}">${msg.is_read ? '' : '✉️ '}${escapeHtml(msg.subject || '(无主题)')}</a></td>
       <td data-label="到达时间" style="color:#666;font-size:13px;">${new Date(msg.received_at).toLocaleString('zh-CN')}</td>
+      <td data-label="操作">
+        <div class="action-group">
+          <a href="/view/${msg.id}" class="btn" style="padding:6px 12px; font-size:13px; text-decoration:none; display:inline-block; text-align:center;">查看</a>
+          <button class="del-btn" style="padding:6px 12px; font-size:13px;" onclick="delMail(${msg.id})">删除</button>
+        </div>
+      </td>
     </tr>
   `).join('');
 
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>收件箱</title>
   <style>${getCommonCss()}
+    .action-group { display:flex; gap:8px; align-items:center; }
     @media(max-width:768px){
       thead{display:none;} tr{display:block; background:#fff; border-radius:8px; margin-bottom:12px; padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.05);}
       td{display:flex; justify-content:space-between; padding:6px 0; border:none; text-align:right;}
       td::before{content:attr(data-label); font-weight:600; color:var(--primary);}
+      .action-group { width: 100%; justify-content: space-between; margin-top:8px; }
+      .action-group > * { flex: 1; }
     }
   </style></head>
   <body>
@@ -673,11 +684,11 @@ function generateListPage(messages, session, page, totalPages) {
       
       <div class="wrapper" style="overflow-x:auto;">
         <div style="padding:12px 16px; border-bottom:1px solid var(--border); display:flex; gap:10px; background:#faf9f7;">
-          <button class="del-btn" onclick="batchDeleteMails()">批量删除</button>
+          <button class="del-btn" onclick="batchDeleteMails()">🗑️ 批量删除</button>
         </div>
         <table>
-          <thead><tr><th style="width:40px;"><input type="checkbox" onchange="document.querySelectorAll('.batch-cb').forEach(cb=>cb.checked=this.checked)"></th><th>收件人</th><th>发件人</th><th>主题</th><th>接收时间</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="5" style="text-align:center;color:#666;padding:30px;">暂无邮件记录。</td></tr>'}</tbody>
+          <thead><tr><th style="width:40px;"><input type="checkbox" onchange="document.querySelectorAll('.batch-cb').forEach(cb=>cb.checked=this.checked)"></th><th>收件邮箱</th><th>发件人</th><th>主题</th><th>接收时间</th><th style="width:140px;">操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="6" style="text-align:center;color:#666;padding:30px;">暂无邮件记录。</td></tr>'}</tbody>
         </table>
         ${generatePaginationHtml(page, totalPages, '/')}
       </div>
@@ -688,6 +699,12 @@ function generateListPage(messages, session, page, totalPages) {
         if (ids.length === 0) return alert('请先勾选需要删除的邮件');
         if (confirm('确定要永久删除选中的 '+ids.length+' 封邮件吗？')) {
           const res = await fetch('/api/batch-delete/messages', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids}) });
+          if(res.ok) location.reload(); else alert('删除失败，权限不足。');
+        }
+      }
+      async function delMail(id) {
+        if(confirm('确定要彻底删除此邮件记录吗？')) {
+          const res = await fetch('/delete/' + id, { method:'POST' });
           if(res.ok) location.reload(); else alert('删除失败，权限不足。');
         }
       }
@@ -729,7 +746,7 @@ function generateUserPage(users, session, page, totalPages) {
     { key: 'mail:delete:all', label: '删除所有邮件', desc: '允许删除系统内所有邮件' },
     { key: 'user:manage:restricted', label: '受限管理普通用户', desc: '允许新增/编辑/删除普通用户' },
     { key: 'user:manage:all', label: '管理所有账户', desc: '允许管理包含管理员在内的所有账户' },
-    { key: 'user:self:password', label: '修改自身密码', desc: '允许当前用户在面板中修改自己的密码' },
+    { key: 'user:self:password', label: '修改自身密码', desc: '【账号安全】：允许当前用户修改自己的密码' },
     { key: 'log:view:all', label: '查看审计日志', desc: '允许查看所有用户的操作日志' },
     { key: 'system:config:view', label: '查看系统配置', desc: '允许只读访问系统设置面板' },
     { key: 'system:config:edit', label: '修改系统配置', desc: '允许修改并保存系统全局设置' }
@@ -806,7 +823,7 @@ function generateUserPage(users, session, page, totalPages) {
           
           <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
             <button type="submit" class="btn">保存设置</button>
-            <button type="button" class="btn" style="background:var(--secondary); color:var(--primary);" onclick="hideForm()">取消</button>
+            <button type="button" class="btn" style="background:var(--secondary); color:var(--primary);" onclick="hideForm()">取消返回</button>
             <button type="button" id="delBtn" class="del-btn" style="margin-left:auto; display:none;" onclick="deleteUser()">删除账户</button>
           </div>
         </form>
@@ -848,7 +865,7 @@ function generateUserPage(users, session, page, totalPages) {
       }
       
       function showCreateForm() {
-        document.getElementById('userListCard').style.display = 'none'; // 隐藏底部用户列表
+        document.getElementById('userListCard').style.display = 'none'; // 隐藏底部所有用户列表
         currentAction = 'create';
         document.getElementById('fTitle').innerText = '新增用户';
         document.getElementById('userId').value = '';
@@ -866,13 +883,13 @@ function generateUserPage(users, session, page, totalPages) {
       }
       
       async function editUser(u) {
-        document.getElementById('userListCard').style.display = 'none'; // 隐藏底部用户列表
+        document.getElementById('userListCard').style.display = 'none'; // 隐藏底部所有用户列表
         currentAction = 'update';
         document.getElementById('fTitle').innerText = '编辑用户 - ' + u.username;
         document.getElementById('userId').value = u.id;
         document.getElementById('uName').value = u.username; document.getElementById('uName').disabled = true;
         document.getElementById('uPass').required = false;
-        document.getElementById('pwdHint').innerText = '(不修改请留空)';
+        document.getElementById('pwdHint').innerText = '(不修改密码请留空)';
         document.getElementById('uRole').value = u.role;
         document.getElementById('uDisabled').checked = u.disabled === 1;
         
@@ -881,29 +898,32 @@ function generateUserPage(users, session, page, totalPages) {
         document.getElementById('uAccess').value = (u.accessible_emails || []).join('\\n');
         document.getElementById('delBtn').style.display = 'inline-block';
         
+        // 加载该用户的日志详情
         const lc = document.getElementById('uLogsContainer');
         lc.style.display = 'block';
-        lc.innerHTML = '<div style="color:#666;">⏳ 正在加载操作日志...</div>';
+        lc.innerHTML = '<div style="color:#666; font-size:14px;">⏳ 正在调取近期操作日志...</div>';
         
         try {
            const res = await fetch('/api/users/' + u.id + '/logs');
+           if(!res.ok) throw new Error();
            const data = await res.json();
-           let html = '<h5 style="color:var(--primary); font-size:15px; margin-bottom:12px;">🔍 该用户的相关操作日志 (最近50条)</h5>';
-           if(data.logs.length === 0) {
-             html += '<div style="color:#666;font-size:13px;">暂无该用户的操作记录。</div>';
-           } else {
-             html += '<div style="max-height:250px; overflow-y:auto; background:#f8fafc; border-radius:6px; border:1px solid var(--border); padding:10px;">';
+           let html = '<h5 style="color:var(--primary); font-size:15px; margin-bottom:12px;">🔍 账户活动轨迹 (涵盖自己发起的操作以及对该账户的变更，最新50条)</h5>';
+           if(data.logs && data.logs.length === 0) {
+             html += '<div style="color:#666;font-size:13px;">暂无该用户的活动记录。</div>';
+           } else if (data.logs) {
+             html += '<div style="max-height:280px; overflow-y:auto; background:#f8fafc; border-radius:6px; border:1px solid var(--border); padding:10px;">';
              data.logs.forEach(l => {
                const st = l.success ? '<span style="color:#22c55e; font-weight:700;">[成功]</span>' : '<span style="color:#ef4444; font-weight:700;">[失败]</span>';
                let desc = ''; try { desc = JSON.parse(l.details).description; } catch(e) { desc = l.details; }
-               html += '<div style="font-size:12px; margin-bottom:8px; border-bottom:1px solid #f1f5f9; padding-bottom:8px; color:var(--text);">';
-               html += '<span style="color:#64748b;">'+new Date(l.created_at).toLocaleString()+'</span> '+st+' <strong style="color:var(--primary);">['+l.action+']</strong> ' + escapeHtml(desc);
+               html += '<div style="font-size:13px; margin-bottom:10px; border-bottom:1px solid #f1f5f9; padding-bottom:10px; color:var(--text); line-height:1.4;">';
+               html += '<div style="color:#64748b; font-size:12px; margin-bottom:4px;">'+new Date(l.created_at).toLocaleString()+' | 由账户 <strong style="color:var(--primary);">'+escapeHtml(l.username)+'</strong> 执行</div>';
+               html += '<div>' + st + ' <span style="background:var(--secondary); color:var(--primary); padding:1px 6px; border-radius:4px; font-weight:600; font-size:12px; margin-right:4px;">'+l.action+'</span> ' + escapeHtml(desc) + '</div>';
                html += '</div>';
              });
              html += '</div>';
            }
            lc.innerHTML = html;
-        } catch(e) { lc.innerHTML = '<div style="color:red;">获取日志异常。</div>'; }
+        } catch(e) { lc.innerHTML = '<div style="color:#ef4444;font-size:14px;">获取操作日志异常，接口未响应或已断开。</div>'; }
 
         document.getElementById('formCard').style.display = 'block';
         document.getElementById('formCard').scrollIntoView({ behavior: 'smooth' });
@@ -911,7 +931,7 @@ function generateUserPage(users, session, page, totalPages) {
       
       function hideForm() { 
         document.getElementById('formCard').style.display = 'none'; 
-        document.getElementById('userListCard').style.display = 'block'; // 恢复显示底部列表
+        document.getElementById('userListCard').style.display = 'block'; // 取消时恢复显示列表
       }
       
       document.getElementById('uForm').onsubmit = async (e) => {
@@ -933,9 +953,9 @@ function generateUserPage(users, session, page, totalPages) {
       };
       
       async function deleteUser() {
-        if(confirm('确定要永久删除该账户吗？')) {
+        if(confirm('确定要永久删除该账户吗？此操作不可逆转。')) {
           const res = await fetch('/admin/users', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ action: 'delete', id: document.getElementById('userId').value }) });
-          if(res.ok) window.location.reload(); else alert('删除失败：权限不足。');
+          if(res.ok) window.location.reload(); else alert('删除失败，权限不足。');
         }
       }
     </script>
@@ -978,7 +998,7 @@ function generateLogPage(logs, session, page, totalPages) {
             <strong style="color:${meta.color}; margin-right:4px;">[${meta.tag}]</strong>
             <strong style="font-size:14px;">${escapeHtml(l.username)}</strong>
             <span style="color:#666; font-size:12px;">（${escapeHtml(l.ip)}）</span>
-            执行 <span style="background:var(--bg); padding:2px 6px; border-radius:4px; font-weight:600; color:var(--primary);">${escapeHtml(desc)}</span> 操作 
+            执行 <span style="background:var(--bg); padding:2px 6px; border-radius:4px; font-weight:600; color:var(--primary);">${escapeHtml(desc)}</span> 
             - 结果：${rs}
           </div>
         </div>
@@ -987,47 +1007,47 @@ function generateLogPage(logs, session, page, totalPages) {
     `;
   }).join('');
 
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>系统审计日志</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>系统操作日志</title>
   <style>${getCommonCss()}</style></head>
   <body>
     <div class="container">
       ${getHeaderNav(session)}
       <div class="wrapper" style="background: #fff; overflow:hidden;">
         <div style="padding:16px 20px; border-bottom:2px solid var(--secondary); background:var(--bg); display:flex; justify-content:space-between; align-items:center;">
-          <h3 style="font-size:16px; font-weight:700; margin:0; color:var(--primary);">📋 系统操作日志</h3>
+          <h3 style="font-size:16px; font-weight:700; margin:0; color:var(--primary);">📋 审计日志库</h3>
           ${isSuper ? `<div><button class="del-btn" style="margin-right:10px;" onclick="batchDeleteLogs()">批量删除</button><button class="btn" style="background:#dc2626; padding:6px 12px; font-size:13px;" onclick="cleanupLogs()">清理过期日志</button></div>` : ''}
         </div>
         <div style="padding:10px 16px; border-bottom:1px solid var(--border); background:#faf9f7;">
            <label style="font-size:13px; font-weight:600; color:var(--primary); cursor:pointer;"><input type="checkbox" onchange="document.querySelectorAll('.batch-cb').forEach(cb=>cb.checked=this.checked)" style="vertical-align:middle;"> 全选本页</label>
         </div>
         <div style="display:flex; flex-direction:column;">
-          ${rows || '<div style="padding:40px; text-align:center; color:#999;">暂无日志记录。</div>'}
+          ${rows || '<div style="padding:40px; text-align:center; color:#999;">暂无任何日志记录。</div>'}
         </div>
         ${generatePaginationHtml(page, totalPages, '/admin/logs')}
       </div>
     </div>
     <script>
       async function cleanupLogs() {
-        if(confirm('确定要清理过期的日志吗？该操作不可恢复！')) {
+        if(confirm('确定要清理过期的日志吗？该操作不可逆转！')) {
           const res = await fetch('/admin/logs/cleanup', { method: 'POST' });
-          if(res.ok) { const data = await res.json(); alert('清理成功，删除了 ' + data.count + ' 条过期记录。'); location.reload(); } 
-          else { alert('清理失败！无操作权限。'); }
+          if(res.ok) { const data = await res.json(); alert('清理成功，共删除 ' + data.count + ' 条记录。'); location.reload(); } 
+          else { alert('清理中止！权限不足。'); }
         }
       }
       
       async function batchDeleteLogs() {
         const ids = Array.from(document.querySelectorAll('.batch-cb:checked')).map(cb => parseInt(cb.value));
-        if (ids.length === 0) return alert('请先勾选需要删除的日志。');
-        if(confirm('确定要删除选中的 '+ids.length+' 条日志吗？')) {
+        if (ids.length === 0) return alert('请勾选要删除的日志。');
+        if(confirm('确定要删除这 '+ids.length+' 条日志吗？')) {
           const res = await fetch('/api/batch-delete/logs', { method: 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids}) });
           if(res.ok) { location.reload(); } else { alert('删除失败。'); }
         }
       }
 
       async function deleteSingleLog(id) {
-        if(confirm('确定要删除此条日志吗？')) {
+        if(confirm('确定要永久删除这条特定的日志记录吗？')) {
           const res = await fetch('/admin/logs/delete/' + id, { method: 'POST' });
-          if(res.ok) { location.reload(); } else { alert('删除失败，权限不足。'); }
+          if(res.ok) { location.reload(); } else { alert('删除失败，仅限超管操作。'); }
         }
       }
     </script>
@@ -1049,43 +1069,47 @@ function generateSettingsPage(config, session) {
     <div class="container">
       ${getHeaderNav(session)}
       <div class="box">
-        <h3 style="margin-bottom:8px; font-size:18px; color:var(--primary); font-weight:800;">⚙️ 系统配置</h3>
-        <p style="color:#666; font-size:13px; margin-bottom:24px;">修改的配置将实时生效。</p>
+        <h3 style="margin-bottom:8px; font-size:18px; color:var(--primary); font-weight:800;">⚙️ 系统全局管控配置</h3>
+        <p style="color:#666; font-size:13px; margin-bottom:24px;">此处设置的数据将实时生效至全局边缘节点。</p>
         
         <form id="sForm">
-          <div class="section-title">登录安全限制</div>
+          <div class="section-title">安全防刷墙策略</div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
             <div class="g">
-              <label>最大登录失败次数 (次)</label>
+              <label>登录失败容错次数 (次)</label>
               <input type="number" id="max_login_failures" value="${config.max_login_failures}" min="1" ${isReadonly?'disabled':''}>
             </div>
             <div class="g">
-              <label>限制登录时长 (小时)</label>
+              <label>失败锁定限制时长 (小时)</label>
               <input type="number" id="lockout_hours" value="${config.lockout_hours}" min="1" ${isReadonly?'disabled':''}>
             </div>
           </div>
           <div class="g" style="margin-top:-10px;">
-            <label>失败次数统计周期 (小时)</label>
+            <label>失败次数错误累积周期 (小时)</label>
             <input type="number" id="failure_window_hours" value="${config.failure_window_hours}" min="1" ${isReadonly?'disabled':''}>
           </div>
           <div class="g">
-            <label>IP 黑名单 (用分号分隔)</label>
-            <textarea id="ip_blacklist" placeholder="192.168.1.1; 10.0.0.5" style="height:60px;" ${isReadonly?'disabled':''}>${config.ip_blacklist || ''}</textarea>
+            <label>IP 拦截黑名单 (多个 IP 用分号 ; 分开)</label>
+            <textarea id="ip_blacklist" placeholder="192.168.1.1; 10.0.0.5" style="height:60px;" ${isReadonly?'disabled':''}>${config.ip_blacklist}</textarea>
           </div>
 
-          <div class="section-title">会话与日志设置</div>
+          <div class="section-title">存储与生命周期管理</div>
+          <div class="g">
+            <label>邮件接收白名单域 (留空则代表全开放，一行一个)</label>
+            <textarea id="domains" style="height:80px;" ${isReadonly?'disabled':''}>${(config.allowed_domains || []).join('\n')}</textarea>
+          </div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
             <div class="g">
-              <label>登录会话有效期 (小时)</label>
+              <label>登录状态凭证有效期 (小时)</label>
               <input type="number" id="expiry" value="${config.session_expiry_hours}" min="1" ${isReadonly?'disabled':''}>
             </div>
             <div class="g">
-              <label>审计日志保留天数 (天)</label>
+              <label>审计日志最大保留期 (天)</label>
               <input type="number" id="logRetention" value="${config.log_retention_days}" min="1" max="365" ${isReadonly?'disabled':''}>
             </div>
           </div>
           
-          ${isReadonly ? '<p style="color:#ef4444;font-size:13px; font-weight:600;">⚠️ 您的账户只有系统配置的只读权限。</p>' : '<button type="submit" class="btn" style="width:100%; font-size:16px; padding:12px;">保存系统配置</button>'}
+          ${isReadonly ? '<p style="color:#ef4444;font-size:13px; font-weight:600;">⚠️ 您当前没有操作修改配置的权限。</p>' : '<button type="submit" class="btn" style="width:100%; font-size:16px; padding:12px;">保存系统配置</button>'}
         </form>
       </div>
     </div>
@@ -1094,6 +1118,7 @@ function generateSettingsPage(config, session) {
         document.getElementById('sForm').onsubmit = async (e) => {
           e.preventDefault();
           const body = {
+            allowed_domains: document.getElementById('domains').value.split('\n').map(d=>d.trim()).filter(Boolean),
             session_expiry_hours: document.getElementById('expiry').value,
             max_login_failures: document.getElementById('max_login_failures').value,
             failure_window_hours: document.getElementById('failure_window_hours').value,
@@ -1103,11 +1128,11 @@ function generateSettingsPage(config, session) {
           };
           const res = await fetch('/admin/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
           if(res.ok) {
-            alert('保存成功！新配置已生效。');
+            alert('系统配置已成功保存并下发生效！');
             window.location.reload();
           } else {
             const data=await res.json();
-            alert('保存失败: '+data.message);
+            alert('保存异常: '+data.message);
           }
         }
       }
