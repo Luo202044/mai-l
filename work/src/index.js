@@ -219,6 +219,14 @@ export default {
           }
         }
 
+        if (env.CONFIG_KV) {
+          const isLocked = await env.CONFIG_KV.get(`lockout:${clientIp}`);
+          if (isLocked) {
+             await logAction(-1, username, 'login', 'user', null, '触发IP频繁失败锁定拦截', false);
+             return new Response(JSON.stringify({ success: false, message: '失败次数过多，该 IP 已被限制登录请稍后再试。' }), { status: 429 });
+          }
+        }
+
         let isSuccess = false; let userId = -1; let userRole = ''; let userPerms = []; let tokenVer = 0;
 
         if (username === SUPER_USER && password === SUPER_PASS) {
@@ -238,10 +246,22 @@ export default {
         }
 
         if (isSuccess) {
+          if (env.CONFIG_KV) await env.CONFIG_KV.delete(`fails:${clientIp}`); 
           const jwt = await generateJWT({ user_id: userId, username, role: userRole, permissions: userPerms, token_version: tokenVer, exp: Date.now() + (expiryHours * 60 * 60 * 1000) });
           await logAction(userId, username, 'login', 'user', userId, '系统登录', true);
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${expiryHours * 3600}` } });
         } else {
+          if (env.CONFIG_KV) {
+            const failKey = `fails:${clientIp}`;
+            let fails = parseInt((await env.CONFIG_KV.get(failKey)) || '0') + 1;
+            const windowSecs = Math.max(60, (config.failure_window_hours || 1) * 3600);
+            await env.CONFIG_KV.put(failKey, fails.toString(), { expirationTtl: windowSecs });
+            if (fails >= (config.max_login_failures || 5)) {
+              const lockoutSecs = Math.max(60, (config.lockout_hours || 2) * 3600);
+              await env.CONFIG_KV.put(`lockout:${clientIp}`, '1', { expirationTtl: lockoutSecs });
+              await env.CONFIG_KV.delete(failKey);
+            }
+          }
           await logAction(-1, username, 'login', 'user', null, '系统登录（密码错误）', false);
           return new Response(JSON.stringify({ success: false, message: '用户名或密码错误' }), { status: 401 });
         }
@@ -312,6 +332,23 @@ export default {
       return new Response(body, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': "default-src 'self' http: https: data: 'unsafe-inline'; script-src 'none'; object-src 'none';" }});
     }
 
+    if (path.startsWith('/delete/') && request.method === 'POST') {
+      const messageId = path.split('/')[2];
+      try {
+        const message = await env.DB.prepare('SELECT mb.email, m.subject FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id WHERE m.id = ?').bind(messageId).first();
+        if (!message) return new Response(JSON.stringify({ success: false, message: '未找到该邮件' }), { status: 404 });
+
+        if (!checkMailAccess(session, message.email, 'delete')) {
+          await logAction(session.user_id, session.username, 'access_denied', 'message', messageId, `越权尝试删除邮件`, false);
+          return new Response(JSON.stringify({ success: false, message: '权限不足' }), { status: 403 });
+        }
+
+        await env.DB.prepare('DELETE FROM messages WHERE id = ?').bind(messageId).run();
+        await logAction(session.user_id, session.username, 'delete_message', 'message', messageId, `删除了邮件: ${message.subject}`, true);
+        return new Response(JSON.stringify({ success: true }));
+      } catch (e) { return new Response(e.message, { status: 500 }); }
+    }
+
     if (path === '/api/batch-delete/messages' && request.method === 'POST') {
       const { ids } = await request.json();
       if (!Array.isArray(ids) || ids.length === 0) return new Response('Bad Request', { status: 400 });
@@ -326,13 +363,12 @@ export default {
       return new Response(JSON.stringify({ success: true, count: authorizedIds.length }));
     }
 
-    // --- 获取指定用户的操作日志（已彻底修复后端类型转化与前端越界报错） ---
+    // --- 获取指定用户的操作日志 API ---
     const logMatch = path.match(/^\/api\/users\/(\d+)\/logs$/);
     if (logMatch && request.method === 'GET') {
       if (!hasPermission('user:manage:restricted') && !hasPermission('user:manage:all')) return new Response(JSON.stringify({error: 'Forbidden'}), {status: 403});
       try {
         const targetIdInt = parseInt(logMatch[1], 10);
-        // 通过类型安全的绑定，同时拉取“该用户做的”以及“别人对该用户做的”记录
         const logs = await env.DB.prepare(`SELECT * FROM audit_logs WHERE user_id = ? OR (target_type = 'user' AND target_id = ?) ORDER BY created_at DESC LIMIT 50`).bind(targetIdInt, String(targetIdInt)).all();
         return new Response(JSON.stringify({logs: logs.results}), {headers:{'Content-Type':'application/json'}});
       } catch(e) {
@@ -350,7 +386,7 @@ export default {
         const offset = (page - 1) * size;
         const countRes = await env.DB.prepare('SELECT COUNT(*) as total FROM users').first();
         const totalPages = Math.ceil(countRes.total / size);
-        const users = await env.DB.prepare('SELECT id, username, role, permissions, accessible_emails, disabled, created_at FROM users ORDER BY id DESC LIMIT ? OFFSET ?').bind(size, offset).all();
+        const users = await env.DB.prepare('SELECT id, username, email, role, permissions, accessible_emails, disabled, created_at FROM users ORDER BY id DESC LIMIT ? OFFSET ?').bind(size, offset).all();
         
         const parsedUsers = users.results.map(u => {
           let perms = [], emails = [];
@@ -366,7 +402,31 @@ export default {
           const body = await request.json();
           const { action, id, username, password, role, permissions, accessible_emails, disabled } = body;
 
-          if (!hasPermission('user:manage:all') && role === 'admin') return new Response(JSON.stringify({ success: false, message: '您无权管理管理员账户' }), { status: 403 });
+          // 【安全防线 1】：绝不允许低权限管理员篡改、创建出更高阶的 Admin 角色
+          if (!hasPermission('user:manage:all') && role === 'admin') {
+              return new Response(JSON.stringify({ success: false, message: '越权拦截：无权创建或提权为管理员' }), { status: 403 });
+          }
+
+          // 【安全防线 2】：提权漏洞修复。任何人分配的功能权限，必须被包含在操作者自身拥有的权限中！
+          if (session.role !== 'superuser') {
+              const unauthorizedPerms = (permissions || []).filter(p => !session.permissions.includes(p));
+              if (unauthorizedPerms.length > 0) {
+                  return new Response(JSON.stringify({ success: false, message: '越权拦截：您不能赋予他人您自身都不具备的功能权限' }), { status: 403 });
+              }
+          }
+
+          // 【安全防线 3】：数据越界修复。分配白名单邮箱时，必须被包含在操作者的白名单内！
+          if (session.role !== 'superuser' && !hasPermission('mail:view:all')) {
+              const unauthorizedEmails = (accessible_emails || []).filter(targetEmail => {
+                  return !(session.accessible_emails || []).some(allowed => {
+                      if (allowed.startsWith('@')) return targetEmail.endsWith(allowed);
+                      return allowed === targetEmail;
+                  });
+              });
+              if (unauthorizedEmails.length > 0) {
+                  return new Response(JSON.stringify({ success: false, message: '越权拦截：您不能分配超脱于您自身管辖范围外的邮箱/域名' }), { status: 403 });
+              }
+          }
 
           if (action === 'create') {
             const pwdHash = await hashPassword(password);
@@ -377,7 +437,9 @@ export default {
 
           if (action === 'update') {
             const target = await env.DB.prepare('SELECT role, permissions, accessible_emails FROM users WHERE id = ?').bind(id).first();
-            if (target.role === 'admin' && !hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '权限不足，无法编辑管理员' }), { status: 403 });
+            if (!target) return new Response(JSON.stringify({ success: false, message: '找不到用户' }), { status: 404 });
+            
+            if (target.role === 'admin' && !hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '越权拦截：受限管理员无法修改全权管理员' }), { status: 403 });
 
             let updateSql = `UPDATE users SET role = ?, permissions = ?, accessible_emails = ?, disabled = ?, token_version = token_version + 1`;
             let params = [role, JSON.stringify(permissions), JSON.stringify(accessible_emails), disabled ? 1 : 0];
@@ -396,7 +458,10 @@ export default {
           }
 
           if (action === 'delete') {
-            if (!hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '权限不足' }), { status: 403 });
+            const target = await env.DB.prepare('SELECT role FROM users WHERE id = ?').bind(id).first();
+            if (target && target.role === 'admin' && !hasPermission('user:manage:all')) {
+                return new Response(JSON.stringify({ success: false, message: '越权拦截：无法删除管理员账户' }), { status: 403 });
+            }
             await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
             await logAction(session.user_id, session.username, 'delete_user', 'user', id, `删除了用户 ID: ${id}`, true);
             return new Response(JSON.stringify({ success: true }));
@@ -456,17 +521,17 @@ export default {
       if (request.method === 'POST' && hasPermission('system:config:edit')) {
         try {
           const body = await request.json();
-          const updateConfig = async (key, val) => {
-             await env.DB.prepare(`INSERT INTO system_config (key, value, updated_by, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated_at=CURRENT_TIMESTAMP`).bind(key, JSON.stringify(val), session.user_id).run();
-          };
-
-          await updateConfig('session_expiry_hours', parseInt(body.session_expiry_hours, 10) || 24);
-          await updateConfig('log_retention_days', parseInt(body.log_retention_days, 10) || 30);
-          await updateConfig('max_login_failures', parseInt(body.max_login_failures, 10) || 5);
-          await updateConfig('failure_window_hours', parseInt(body.failure_window_hours, 10) || 1);
-          await updateConfig('lockout_hours', parseInt(body.lockout_hours, 10) || 2);
-          await updateConfig('ip_blacklist', body.ip_blacklist || "");
-          
+          if (env.CONFIG_KV) {
+            const newConfig = {
+              log_retention_days: parseInt(body.log_retention_days, 10) || 30,
+              session_expiry_hours: parseInt(body.session_expiry_hours, 10) || 24,
+              max_login_failures: parseInt(body.max_login_failures, 10) || 5,
+              failure_window_hours: parseInt(body.failure_window_hours, 10) || 1,
+              lockout_hours: parseInt(body.lockout_hours, 10) || 2,
+              ip_blacklist: body.ip_blacklist || ""
+            };
+            await env.CONFIG_KV.put('system_config', JSON.stringify(newConfig));
+          }
           await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '修改了系统全局配置', true);
           return new Response(JSON.stringify({ success: true }));
         } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
@@ -482,6 +547,7 @@ export default {
 // ==========================================
 function checkMailAccess(session, targetEmail, type) {
   if (session.role === 'superuser' || session.permissions.includes(`mail:${type}:all`)) return true;
+  
   if (session.permissions.includes(`mail:${type}:allowed`) || session.permissions.includes(`mail:${type}:own`)) {
     if (!session.accessible_emails) return false;
     return session.accessible_emails.some(allowed => {
@@ -492,15 +558,11 @@ function checkMailAccess(session, targetEmail, type) {
   return false;
 }
 
-// 废弃旧的 SQL 内存缓存，全量直连，保证秒级生效
 async function getSystemConfig(env) {
-  const rows = await env.DB.prepare('SELECT key, value FROM system_config').all();
-  const config = { log_retention_days: 30, session_expiry_hours: 24, max_login_failures: 5, failure_window_hours: 1, lockout_hours: 2, ip_blacklist: "", allowed_domains: [] };
-  rows.results.forEach(row => { 
-    try { config[row.key] = JSON.parse(row.value); } 
-    catch(e) { config[row.key] = row.value; } 
-  });
-  return config;
+  const defaultConfig = { log_retention_days: 30, session_expiry_hours: 24, max_login_failures: 5, failure_window_hours: 1, lockout_hours: 2, ip_blacklist: "" };
+  if (!env.CONFIG_KV) return defaultConfig;
+  const val = await env.CONFIG_KV.get('system_config', 'json');
+  return val ? { ...defaultConfig, ...val } : defaultConfig;
 }
 
 async function ensureTables(env) {
@@ -515,7 +577,7 @@ function parseCookies(header) {
 }
 
 // ==========================================
-// 4. 🎨 凡戴克棕 + 浅卡其色 UI 渲染引擎
+// 4. 🎨 凡戴克棕 + 浅卡其色 UI 系统
 // ==========================================
 function getHeaderNav(session) {
   const hasUserManage = session.role === 'superuser' || session.permissions.includes('user:manage:restricted') || session.permissions.includes('user:manage:all');
@@ -732,7 +794,7 @@ function generateUserPage(users, session, page, totalPages) {
     { key: 'mail:delete:all', label: '删除所有邮件', desc: '允许删除系统内所有邮件' },
     { key: 'user:manage:restricted', label: '受限管理普通用户', desc: '允许新增/编辑/删除普通用户' },
     { key: 'user:manage:all', label: '管理所有账户', desc: '允许管理包含管理员在内的所有账户' },
-    { key: 'user:self:password', label: '修改自身密码', desc: '【账号安全】：允许当前用户修改自己的密码' },
+    { key: 'user:self:password', label: '修改自身密码', desc: '允许当前用户在面板中修改自己的密码' },
     { key: 'log:view:all', label: '查看审计日志', desc: '允许查看所有用户的操作日志' },
     { key: 'system:config:view', label: '查看系统配置', desc: '允许只读访问系统设置面板' },
     { key: 'system:config:edit', label: '修改系统配置', desc: '允许修改并保存系统全局设置' }
@@ -743,7 +805,7 @@ function generateUserPage(users, session, page, totalPages) {
       <td data-label="用户名" style="font-weight:600; color:var(--primary);">${escapeHtml(u.username)}</td>
       <td data-label="角色"><span class="badge">${u.role === 'admin' ? '管理员' : '普通用户'}</span></td>
       <td data-label="状态">${u.disabled ? '<span style="color:#ef4444;font-weight:600;">禁用</span>' : '<span style="color:#22c55e;font-weight:600;">正常</span>'}</td>
-      <td data-label="操作"><button class="btn" style="padding:6px 12px; font-size:13px;" onclick="editUserById(${u.id})">编辑</button></td>
+      <td data-label="操作"><button class="btn" style="padding:6px 12px; font-size:13px;" onclick="editUserById(${u.id})">编辑用户</button></td>
     </tr>
   `).join('');
 
@@ -831,7 +893,7 @@ function generateUserPage(users, session, page, totalPages) {
         if (!unsafe) return '';
         return String(unsafe).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
       }
-    
+
       const USERS_DATA = ${JSON.stringify(users)};
       let currentAction = 'create';
       
@@ -891,23 +953,23 @@ function generateUserPage(users, session, page, totalPages) {
         
         const lc = document.getElementById('uLogsContainer');
         lc.style.display = 'block';
-        lc.innerHTML = '<div style="color:#666; font-size:14px;">⏳ 正在调取近期操作日志...</div>';
+        lc.innerHTML = '<div style="color:#666; font-size:14px;">⏳ 正在加载操作日志...</div>';
         
         try {
            const res = await fetch('/api/users/' + u.id + '/logs');
            if(!res.ok) throw new Error();
            const data = await res.json();
-           let html = '<h5 style="color:var(--primary); font-size:15px; margin-bottom:12px;">🔍 账户活动轨迹 (涵盖自己发起的操作以及对该账户的变更，最新50条)</h5>';
+           let html = '<h5 style="color:var(--primary); font-size:15px; margin-bottom:12px;">🔍 账户近期操作日志 (涵盖自己发起的操作以及对该账户的变更记录)</h5>';
            if(data.logs && data.logs.length === 0) {
-             html += '<div style="color:#666;font-size:13px;">暂无该用户的活动记录。</div>';
+             html += '<div style="color:#666;font-size:13px;">暂无该用户的操作记录。</div>';
            } else if (data.logs) {
              html += '<div style="max-height:280px; overflow-y:auto; background:#f8fafc; border-radius:6px; border:1px solid var(--border); padding:10px;">';
              data.logs.forEach(l => {
                const st = l.success ? '<span style="color:#22c55e; font-weight:700;">[成功]</span>' : '<span style="color:#ef4444; font-weight:700;">[失败]</span>';
                let desc = ''; try { desc = JSON.parse(l.details).description; } catch(e) { desc = l.details; }
                html += '<div style="font-size:13px; margin-bottom:10px; border-bottom:1px solid #f1f5f9; padding-bottom:10px; color:var(--text); line-height:1.4;">';
-               html += '<div style="color:#64748b; font-size:12px; margin-bottom:4px;">'+new Date(l.created_at).toLocaleString()+' | 由账户 <strong style="color:var(--primary);">'+escapeHtml(l.username)+'</strong> 执行</div>';
-               html += '<div>' + st + ' <span style="background:var(--secondary); color:var(--primary); padding:1px 6px; border-radius:4px; font-weight:600; font-size:12px; margin-right:4px;">'+l.action+'</span> ' + escapeHtml(desc) + '</div>';
+               html += '<div style="color:#64748b; font-size:12px; margin-bottom:4px;">'+new Date(l.created_at).toLocaleString()+' | 操作者: <strong style="color:var(--primary);">'+escapeHtml(l.username)+'</strong></div>';
+               html += '<div>' + st + ' <span style="background:var(--secondary); color:var(--primary); padding:1px 6px; border-radius:4px; font-weight:600; font-size:12px; margin-right:4px;">'+escapeHtml(l.action)+'</span> ' + escapeHtml(desc) + '</div>';
                html += '</div>';
              });
              html += '</div>';
@@ -1017,6 +1079,11 @@ function generateLogPage(logs, session, page, totalPages) {
       </div>
     </div>
     <script>
+      function escapeHtml(unsafe) {
+        if (!unsafe) return '';
+        return String(unsafe).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+      }
+      
       async function cleanupLogs() {
         if(confirm('确定要清理过期的日志吗？该操作不可恢复！')) {
           const res = await fetch('/admin/logs/cleanup', { method: 'POST' });
