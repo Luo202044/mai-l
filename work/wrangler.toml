@@ -21,3 +21,7 @@ head_sampling_rate = 1
 binding = "DB"
 database_name = "2"
 database_id = "f5741442-e1d9-4f04-9545-daf238b28660"
+
+[[kv_namespaces]]
+binding = "CONFIG_KV"
+id = "f67cc74352e9404dabc6efc24fd599ed"
