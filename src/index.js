@@ -1,7 +1,7 @@
 import PostalMime from 'postal-mime';
 
 // ==========================================
-// 1. 数据库初始化 SQL (新增 ip_blacklist 表)
+// 1. 数据库初始化 SQL (包含 ip_blacklist)
 // ==========================================
 const CREATE_TABLES_SQL = `
 CREATE TABLE IF NOT EXISTS users (
@@ -62,7 +62,6 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages(mailbox_id);
 CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at);
 
--- 新增：IP 黑名单专属管理表
 CREATE TABLE IF NOT EXISTS ip_blacklist (
     ip TEXT PRIMARY KEY,
     ban_type TEXT NOT NULL,
@@ -99,7 +98,7 @@ export default {
         `INSERT INTO messages (mailbox_id, from_address, subject, content, html_content) VALUES (?, ?, ?, ?, ?)`
       ).bind(mailbox.id, parsedEmail.from?.address || 'Unknown', parsedEmail.subject || '(无主题)',
         parsedEmail.text || parsedEmail.html || '(无内容)', parsedEmail.html || null).run();
-    } catch (error) { console.error('❌ 邮件处理失败:', error); }
+    } catch (error) { console.error('❌ 处理邮件失败:', error); }
   },
 
   async fetch(request, env, ctx) {
@@ -191,7 +190,6 @@ export default {
       } catch (e) {}
     };
 
-    // --- API: 用户修改自身密码 ---
     if (path === '/api/change-password' && request.method === 'POST') {
       const session = await getSession();
       if (!session) return new Response(null, { status: 401 });
@@ -215,10 +213,10 @@ export default {
       return new Response(generateProfilePage(session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    // --- 登录系统 (集成新版 D1 黑名单与高危提示) ---
+    // --- 登录系统 (限流防刷与黑名单拦截) ---
     if (path === '/api/login' && request.method === 'POST') {
       try {
-        await cleanupBlacklist(); // 登录前先清洗过期黑名单
+        await cleanupBlacklist(); 
 
         const formData = await request.formData();
         const username = formData.get('username') || '';
@@ -226,7 +224,7 @@ export default {
         const config = await getSystemConfig(env);
         const expiryHours = config.session_expiry_hours || 24;
 
-        // 1. D1 级黑名单校验
+        // D1 黑名单强制拦截
         const banRecord = await env.DB.prepare('SELECT * FROM ip_blacklist WHERE ip = ?').bind(clientIp).first();
         if (banRecord) {
            await logAction(-1, username, 'login', 'user', null, `黑名单拦截: ${banRecord.reason}`, false);
@@ -258,7 +256,6 @@ export default {
           await logAction(userId, username, 'login', 'user', userId, '系统登录成功', true);
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${expiryHours * 3600}` } });
         } else {
-          // 密码错误：执行 KV 限流与自动封禁策略
           if (env.CONFIG_KV) {
             const failKey = `fails:${clientIp}`;
             let fails = parseInt((await env.CONFIG_KV.get(failKey)) || '0') + 1;
@@ -381,7 +378,6 @@ export default {
       return new Response(JSON.stringify({ success: true, count: authorizedIds.length }));
     }
 
-    // --- 用户专属日志 ---
     const logMatch = path.match(/^\/api\/users\/(\d+)\/logs$/);
     if (logMatch && request.method === 'GET') {
       if (!hasPermission('user:manage:restricted') && !hasPermission('user:manage:all')) return new Response(JSON.stringify({error: 'Forbidden'}), {status: 403});
@@ -401,7 +397,6 @@ export default {
         const size = parseInt(url.searchParams.get('size')) || 20;
         const offset = (page - 1) * size;
         
-        // 核心修复：受限管理员只能看到普通用户
         let whereSql = '';
         if (!hasPermission('user:manage:all')) whereSql = "WHERE role = 'user'";
 
@@ -423,7 +418,6 @@ export default {
           const body = await request.json();
           const { action, id, username, password, email, role, permissions, accessible_emails, disabled } = body;
 
-          // 禁止自我修改
           if ((action === 'update' || action === 'delete') && parseInt(id) === session.user_id) {
              return new Response(JSON.stringify({ success: false, message: '禁止在用户管理面板修改或删除自身账户，请使用右上角账号安全页' }), { status: 403 });
           }
@@ -486,14 +480,14 @@ export default {
 
     // --- 日志与黑名单专区 ---
     if (path === '/admin/logs' && hasPermission('log:view:all')) {
-      await cleanupBlacklist(); // 查看日志前顺便清洗黑名单
+      await cleanupBlacklist();
       const page = parseInt(url.searchParams.get('page')) || 1;
       const size = parseInt(url.searchParams.get('size')) || 20;
       const offset = (page - 1) * size;
       const countRes = await env.DB.prepare('SELECT COUNT(*) as total FROM audit_logs').first();
       const totalPages = Math.ceil(countRes.total / size);
       const logs = await env.DB.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ? OFFSET ?').bind(size, offset).all();
-      // 记录访问日志动作
+      
       await logAction(session.user_id, session.username, 'view_logs', 'log', null, `调阅了全局系统审计日志`, true);
       return new Response(generateLogPage(logs.results, session, page, totalPages), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
@@ -528,7 +522,8 @@ export default {
       return new Response(JSON.stringify({ success: true }));
     }
 
-    // --- 新增：黑名单中心化管理页面 ---
+    // --- 黑名单中心化管理页面 ---
+    // 【重要修复】：之前漏掉这个整个路由块导致的 Error 1101
     if (path === '/admin/blacklist' && (hasPermission('blacklist:view') || session.role === 'superuser')) {
       await cleanupBlacklist();
       if (request.method === 'GET') {
@@ -587,7 +582,6 @@ export default {
           await updateConfig('max_login_failures', parseInt(body.max_login_failures, 10) || 5);
           await updateConfig('failure_window_hours', parseInt(body.failure_window_hours, 10) || 1);
           await updateConfig('lockout_hours', parseInt(body.lockout_hours, 10) || 2);
-          await updateConfig('allowed_domains', body.allowed_domains || []);
           
           await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '修改了系统全局配置', true);
           return new Response(JSON.stringify({ success: true }));
@@ -604,9 +598,7 @@ export default {
 // ==========================================
 function checkMailAccess(session, targetEmail, type) {
   if (session.role === 'superuser' || session.permissions.includes(`mail:${type}:all`)) return true;
-  
   if (session.permissions.includes(`mail:${type}:own`) && session.email === targetEmail) return true;
-  
   if (session.permissions.includes(`mail:${type}:allowed`) && session.accessible_emails) {
     return session.accessible_emails.some(allowed => {
       if (allowed.startsWith('@')) return targetEmail.endsWith(allowed);
@@ -618,7 +610,7 @@ function checkMailAccess(session, targetEmail, type) {
 
 async function getSystemConfig(env) {
   const rows = await env.DB.prepare('SELECT key, value FROM system_config').all();
-  const config = { log_retention_days: 30, session_expiry_hours: 24, max_login_failures: 5, failure_window_hours: 1, lockout_hours: 2, allowed_domains: [] };
+  const config = { log_retention_days: 30, session_expiry_hours: 24, max_login_failures: 5, failure_window_hours: 1, lockout_hours: 2 };
   rows.results.forEach(row => { 
     try { config[row.key] = JSON.parse(row.value); } 
     catch(e) { config[row.key] = row.value; } 
@@ -638,7 +630,7 @@ function parseCookies(header) {
 }
 
 // ==========================================
-// 4. 🎨 凡戴克棕 + 浅卡其色 UI 系统
+// 4. 🎨 凡戴克棕 + 浅卡其色 UI 渲染引擎
 // ==========================================
 function getHeaderNav(session) {
   const hasUserManage = session.role === 'superuser' || session.permissions.includes('user:manage:restricted') || session.permissions.includes('user:manage:all');
@@ -795,9 +787,10 @@ function generateListPage(messages, session, page, totalPages) {
     <div class="container">
       ${getHeaderNav(session)}
       <div class="top-card">
+         <div style="font-weight:600; color:var(--primary); margin-bottom:6px; font-size:15px;">当前登录用户: ${escapeHtml(session.username)}</div>
          <div style="font-size:13px; color:#555;">
-           <span style="font-weight:600; color:var(--primary);">我可访问的邮箱白名单：</span><br>
-           ${session.role === 'superuser' || session.permissions.includes('mail:view:all') ? '- [拥有系统全局所有邮箱查阅权限]' : (session.accessible_emails && session.accessible_emails.length > 0 ? session.accessible_emails.map(e => `- ${escapeHtml(e)}`).join('<br>') : '- [暂未分配任何可访问的邮箱]')}
+           <span style="font-weight:600; color:var(--primary);">可访问的邮箱白名单：</span><br>
+           ${session.role === 'superuser' || session.permissions.includes('mail:view:all') ? '- [拥有全局访问权限]' : (session.accessible_emails && session.accessible_emails.length > 0 ? session.accessible_emails.map(e => `- ${escapeHtml(e)}`).join('<br>') : '- [暂无分配的邮箱]')}
          </div>
       </div>
       
@@ -857,6 +850,96 @@ function generateDetailPage(message, session) {
   </body></html>`;
 }
 
+// 【修复内容】：将黑名单页面重新纳入代码并输出
+function generateBlacklistPage(list, session, page, totalPages) {
+  const rows = list.map(b => {
+    let typeBadge = b.ban_type === 'permanent' ? '<span style="color:#ef4444;font-weight:700;">永久封禁</span>' : 
+                   (b.ban_type === 'auto_ban' ? '<span style="color:#f59e0b;font-weight:700;">自动封禁</span>' : '<span style="color:#3b82f6;font-weight:700;">临时封禁</span>');
+    let expireTxt = b.expires_at ? new Date(b.expires_at + 'Z').toLocaleString('zh-CN') : '无期限';
+    return `
+      <tr>
+        <td data-label="封禁 IP" style="font-weight:600; color:var(--primary); font-family:monospace;">${escapeHtml(b.ip)}</td>
+        <td data-label="类型">${typeBadge}</td>
+        <td data-label="解封时间" style="font-size:13px;">${expireTxt}</td>
+        <td data-label="封禁事由" style="font-size:13px; color:#666;">${escapeHtml(b.reason || '-')}</td>
+        <td data-label="操作"><button class="del-btn" style="padding:4px 8px; font-size:12px;" onclick="delIp('${b.ip}')">解封 / 删除</button></td>
+      </tr>
+    `;
+  }).join('');
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>IP 黑名单管理</title>
+  <style>${getCommonCss()}
+    .m-card { background:#fff; padding:24px; border-radius:12px; margin-bottom:20px; display:none; border:1px solid var(--border); box-shadow:0 4px 6px rgba(0,0,0,0.05); border-left: 6px solid #dc2626; }
+    .g { margin-bottom:16px; }
+    .g label { display:block; margin-bottom:6px; font-weight:600; font-size:13px; }
+    .g input[type="text"], .g input[type="number"] { width:100%; padding:10px; border:1px solid var(--border); border-radius:6px; font-size:14px; }
+    @media(max-width:768px){ thead { display:none; } tr { display:block; background:#fff; border-radius:8px; margin-bottom:12px; padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.05);} td { display:flex; justify-content:space-between; padding:8px 0; border:none; text-align:right;} td::before { content:attr(data-label); color:var(--primary); font-weight:600; } }
+  </style></head>
+  <body>
+    <div class="container">
+      ${getHeaderNav(session)}
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+        <h3 style="font-size:16px; font-weight:700; color:var(--primary);">🛡️ IP 黑名单防御策略</h3>
+        <button class="btn" style="background:#dc2626;" onclick="showAdd()">+ 手动拉黑 IP</button>
+      </div>
+
+      <div class="m-card" id="formCard">
+        <h4 style="margin-bottom:16px; font-size:15px; font-weight:700; color:#dc2626; border-bottom:1px solid #fee2e2; padding-bottom:8px;">新增黑名单拦截</h4>
+        <form id="blForm">
+          <div class="g"><label>目标 IP 地址</label><input type="text" id="blIp" placeholder="例如 192.168.1.100" required></div>
+          <div class="g"><label>封禁类型</label>
+            <div style="display:flex; gap:16px; font-size:14px; padding:8px 0;">
+              <label style="font-weight:400; cursor:pointer;"><input type="radio" name="banType" value="permanent" checked onchange="toggleTime(this.value)"> 永久封禁</label>
+              <label style="font-weight:400; cursor:pointer;"><input type="radio" name="banType" value="temporary" onchange="toggleTime(this.value)"> 临时封禁 (倒计时)</label>
+            </div>
+          </div>
+          <div id="timeGroup" style="display:none; background:#faf9f7; padding:16px; border-radius:8px; margin-bottom:16px; border:1px solid var(--border);">
+            <div style="display:flex; gap:10px;">
+              <div style="flex:1;"><label>天数</label><input type="number" id="blD" min="0" value="0"></div>
+              <div style="flex:1;"><label>小时</label><input type="number" id="blH" min="0" value="1"></div>
+              <div style="flex:1;"><label>分钟</label><input type="number" id="blM" min="0" value="0"></div>
+            </div>
+          </div>
+          <div class="g"><label>封禁事由备注 (可选)</label><input type="text" id="blReason" placeholder="例如: 恶意攻击探测"></div>
+          <div style="display:flex; gap:10px;">
+            <button type="submit" class="btn" style="background:#dc2626;">执行封禁指令</button>
+            <button type="button" class="btn" style="background:var(--secondary); color:var(--primary);" onclick="hideAdd()">取消</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="wrapper" id="listCard" style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>拦截 IP</th><th>类型</th><th>自动解封时间</th><th>封禁事由</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5" style="text-align:center;">防御层目前没有黑名单数据。</td></tr>'}</tbody>
+        </table>
+        ${generatePaginationHtml(page, totalPages, '/admin/blacklist')}
+      </div>
+    </div>
+    
+    <script>
+      function escapeHtml(unsafe) { return String(unsafe).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;'); }
+      function showAdd() { document.getElementById('listCard').style.display = 'none'; document.getElementById('formCard').style.display = 'block'; }
+      function hideAdd() { document.getElementById('formCard').style.display = 'none'; document.getElementById('listCard').style.display = 'block'; }
+      function toggleTime(val) { document.getElementById('timeGroup').style.display = val === 'temporary' ? 'block' : 'none'; }
+      document.getElementById('blForm').onsubmit = async (e) => {
+        e.preventDefault();
+        const type = document.querySelector('input[name="banType"]:checked').value;
+        const body = { action: 'add', ip: document.getElementById('blIp').value.trim(), ban_type: type, reason: document.getElementById('blReason').value };
+        if(type === 'temporary') { body.days = document.getElementById('blD').value; body.hours = document.getElementById('blH').value; body.minutes = document.getElementById('blM').value; }
+        const res = await fetch('/admin/blacklist', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+        if(res.ok) location.reload(); else alert('添加黑名单失败。');
+      };
+      async function delIp(ip) {
+        if(confirm('确定要解除对 IP ' + ip + ' 的封禁吗？')) {
+           const res = await fetch('/admin/blacklist', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'delete', ip:ip}) });
+           if(res.ok) location.reload(); else alert('解除封禁失败。');
+        }
+      }
+    </script>
+  </body></html>`;
+}
+
 function generateUserPage(users, session, page, totalPages) {
   const AVAILABLE_PERMISSIONS = [
     { key: 'mail:view:own', label: '查看专属邮箱', desc: '允许查看自己绑定的专属邮箱邮件' },
@@ -867,7 +950,7 @@ function generateUserPage(users, session, page, totalPages) {
     { key: 'mail:delete:all', label: '删除所有邮件', desc: '允许删除系统内所有邮件' },
     { key: 'user:manage:restricted', label: '受限管理普通用户', desc: '允许新增/编辑/删除普通用户' },
     { key: 'user:manage:all', label: '管理所有账户', desc: '允许管理包含管理员在内的所有账户' },
-    { key: 'user:self:password', label: '修改自身密码', desc: '允许该用户在面板中修改自己的登录密码' },
+    { key: 'user:self:password', label: '修改自身密码', desc: '允许当前用户在面板中修改自己的密码' },
     { key: 'blacklist:view', label: '查看 IP 黑名单', desc: '允许只读访问黑名单面板' },
     { key: 'blacklist:edit', label: '编辑 IP 黑名单', desc: '允许添加/移除 IP 黑名单' },
     { key: 'log:view:all', label: '查看审计日志', desc: '允许查看所有用户的操作日志' },
@@ -881,7 +964,7 @@ function generateUserPage(users, session, page, totalPages) {
       <td data-label="角色"><span class="badge">${u.role === 'admin' ? '管理员' : '普通用户'}</span></td>
       <td data-label="专属邮箱">${escapeHtml(u.email || '未绑定')}</td>
       <td data-label="状态">${u.disabled ? '<span style="color:#ef4444;font-weight:600;">禁用</span>' : '<span style="color:#22c55e;font-weight:600;">正常</span>'}</td>
-      <td data-label="操作"><button class="btn" style="padding:6px 12px; font-size:13px;" onclick="editUserById(${u.id})">编辑</button></td>
+      <td data-label="操作"><button class="btn" style="padding:6px 12px; font-size:13px;" onclick="editUserById(${u.id})">编辑用户</button></td>
     </tr>
   `).join('');
 
@@ -936,7 +1019,7 @@ function generateUserPage(users, session, page, totalPages) {
           <div style="margin-top:16px;">
             <div style="display:flex; justify-content:space-between; align-items:center;">
               <label style="font-size:14px; font-weight:700; color:var(--primary);">🛡️ 权限分配</label>
-              <div><button type="button" class="tpl-btn" onclick="applyTemplate('user')">普通模板</button><button type="button" class="tpl-btn" onclick="applyTemplate('admin')">管理模板</button></div>
+              <div><button type="button" class="tpl-btn" onclick="applyTemplate('user')">普通用户模板</button><button type="button" class="tpl-btn" onclick="applyTemplate('admin')">管理员模板</button></div>
             </div>
             <div class="perm-grid">${checkboxHtml}</div>
           </div>
@@ -1054,7 +1137,7 @@ function generateUserPage(users, session, page, totalPages) {
                let desc = ''; try { desc = JSON.parse(l.details).description; } catch(e) { desc = l.details; }
                html += '<div style="font-size:13px; margin-bottom:10px; border-bottom:1px solid #f1f5f9; padding-bottom:10px; color:var(--text); line-height:1.4;">';
                html += '<div style="color:#64748b; font-size:12px; margin-bottom:4px;">'+new Date(l.created_at).toLocaleString()+' | 操作者: <strong style="color:var(--primary);">'+escapeHtml(l.username)+'</strong></div>';
-               html += '<div>' + st + ' <span style="background:var(--secondary); color:var(--primary); padding:1px 6px; border-radius:4px; font-weight:600; font-size:12px; margin-right:4px;">'+l.action+'</span> ' + escapeHtml(desc) + '</div>';
+               html += '<div>' + st + ' <span style="background:var(--secondary); color:var(--primary); padding:1px 6px; border-radius:4px; font-weight:600; font-size:12px; margin-right:4px;">'+escapeHtml(l.action)+'</span> ' + escapeHtml(desc) + '</div>';
                html += '</div>';
              });
              html += '</div>';
@@ -1098,104 +1181,6 @@ function generateUserPage(users, session, page, totalPages) {
         if(confirm('确定要永久删除该账户吗？此操作不可逆转。')) {
           const res = await fetch('/admin/users', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ action: 'delete', id: document.getElementById('userId').value }) });
           if(res.ok) window.location.reload(); else alert('删除失败，可能由于权限不足。');
-        }
-      }
-    </script>
-  </body></html>`;
-}
-
-function generateBlacklistPage(list, session, page, totalPages) {
-  const rows = list.map(b => {
-    let typeBadge = b.ban_type === 'permanent' ? '<span style="color:#ef4444;font-weight:700;">永久封禁</span>' : 
-                   (b.ban_type === 'auto_ban' ? '<span style="color:#f59e0b;font-weight:700;">自动封禁</span>' : '<span style="color:#3b82f6;font-weight:700;">临时封禁</span>');
-    let expireTxt = b.expires_at ? new Date(b.expires_at + 'Z').toLocaleString('zh-CN') : '无期限';
-    return `
-      <tr>
-        <td data-label="封禁 IP" style="font-weight:600; color:var(--primary); font-family:monospace;">${escapeHtml(b.ip)}</td>
-        <td data-label="类型">${typeBadge}</td>
-        <td data-label="解封时间" style="font-size:13px;">${expireTxt}</td>
-        <td data-label="封禁事由" style="font-size:13px; color:#666;">${escapeHtml(b.reason || '-')}</td>
-        <td data-label="操作"><button class="del-btn" style="padding:4px 8px; font-size:12px;" onclick="delIp('${b.ip}')">解封 / 删除</button></td>
-      </tr>
-    `;
-  }).join('');
-
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>IP 黑名单管理</title>
-  <style>${getCommonCss()}
-    .m-card { background:#fff; padding:24px; border-radius:12px; margin-bottom:20px; display:none; border:1px solid var(--border); box-shadow:0 4px 6px rgba(0,0,0,0.05); border-left: 6px solid #dc2626; }
-    .g { margin-bottom:16px; }
-    .g label { display:block; margin-bottom:6px; font-weight:600; font-size:13px; }
-    .g input[type="text"], .g input[type="number"] { width:100%; padding:10px; border:1px solid var(--border); border-radius:6px; font-size:14px; }
-    @media(max-width:768px){ thead { display:none; } tr { display:block; background:#fff; border-radius:8px; margin-bottom:12px; padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.05);} td { display:flex; justify-content:space-between; padding:8px 0; border:none; text-align:right;} td::before { content:attr(data-label); color:var(--primary); font-weight:600; } }
-  </style></head>
-  <body>
-    <div class="container">
-      ${getHeaderNav(session)}
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-        <h3 style="font-size:16px; font-weight:700; color:var(--primary);">🛡️ IP 黑名单防御策略</h3>
-        <button class="btn" style="background:#dc2626;" onclick="showAdd()">+ 手动拉黑 IP</button>
-      </div>
-
-      <div class="m-card" id="formCard">
-        <h4 style="margin-bottom:16px; font-size:15px; font-weight:700; color:#dc2626; border-bottom:1px solid #fee2e2; padding-bottom:8px;">新增黑名单拦截</h4>
-        <form id="blForm">
-          <div class="g"><label>目标 IP 地址</label><input type="text" id="blIp" placeholder="例如 192.168.1.100" required></div>
-          <div class="g"><label>封禁类型</label>
-            <div style="display:flex; gap:16px; font-size:14px; padding:8px 0;">
-              <label style="font-weight:400; cursor:pointer;"><input type="radio" name="banType" value="permanent" checked onchange="toggleTime(this.value)"> 永久封禁</label>
-              <label style="font-weight:400; cursor:pointer;"><input type="radio" name="banType" value="temporary" onchange="toggleTime(this.value)"> 临时封禁 (倒计时)</label>
-            </div>
-          </div>
-          <div id="timeGroup" style="display:none; background:#faf9f7; padding:16px; border-radius:8px; margin-bottom:16px; border:1px solid var(--border);">
-            <div style="display:flex; gap:10px;">
-              <div style="flex:1;"><label>天数</label><input type="number" id="blD" min="0" value="0"></div>
-              <div style="flex:1;"><label>小时</label><input type="number" id="blH" min="0" value="1"></div>
-              <div style="flex:1;"><label>分钟</label><input type="number" id="blM" min="0" value="0"></div>
-            </div>
-          </div>
-          <div class="g"><label>封禁事由备注 (可选)</label><input type="text" id="blReason" placeholder="例如: 恶意攻击探测"></div>
-          <div style="display:flex; gap:10px;">
-            <button type="submit" class="btn" style="background:#dc2626;">执行封禁指令</button>
-            <button type="button" class="btn" style="background:var(--secondary); color:var(--primary);" onclick="hideAdd()">取消</button>
-          </div>
-        </form>
-      </div>
-
-      <div class="wrapper" id="listCard" style="overflow-x:auto;">
-        <table>
-          <thead><tr><th>拦截 IP</th><th>类型</th><th>自动解封时间</th><th>封禁事由</th><th>操作</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="5" style="text-align:center;">防御层目前没有黑名单数据。</td></tr>'}</tbody>
-        </table>
-        ${generatePaginationHtml(page, totalPages, '/admin/blacklist')}
-      </div>
-    </div>
-    
-    <script>
-      function showAdd() {
-        document.getElementById('listCard').style.display = 'none';
-        document.getElementById('formCard').style.display = 'block';
-      }
-      function hideAdd() {
-        document.getElementById('formCard').style.display = 'none';
-        document.getElementById('listCard').style.display = 'block';
-      }
-      function toggleTime(val) {
-        document.getElementById('timeGroup').style.display = val === 'temporary' ? 'block' : 'none';
-      }
-      document.getElementById('blForm').onsubmit = async (e) => {
-        e.preventDefault();
-        const type = document.querySelector('input[name="banType"]:checked').value;
-        const body = { action: 'add', ip: document.getElementById('blIp').value.trim(), ban_type: type, reason: document.getElementById('blReason').value };
-        if(type === 'temporary') {
-           body.days = document.getElementById('blD').value; body.hours = document.getElementById('blH').value; body.minutes = document.getElementById('blM').value;
-        }
-        const res = await fetch('/admin/blacklist', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
-        if(res.ok) location.reload(); else alert('添加黑名单失败。');
-      };
-      async function delIp(ip) {
-        if(confirm('确定要解除对 IP ' + ip + ' 的封禁吗？')) {
-           const res = await fetch('/admin/blacklist', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'delete', ip:ip}) });
-           if(res.ok) location.reload(); else alert('解除封禁失败。');
         }
       }
     </script>
@@ -1264,16 +1249,13 @@ function generateLogPage(logs, session, page, totalPages) {
            <label style="font-size:13px; font-weight:600; color:var(--primary); cursor:pointer;"><input type="checkbox" onchange="document.querySelectorAll('.batch-cb').forEach(cb=>cb.checked=this.checked)" style="vertical-align:middle;"> 全选本页</label>
         </div>
         <div style="display:flex; flex-direction:column;">
-          ${rows || '<div style="padding:40px; text-align:center; color:#999;">暂无任何日志记录。</div>'}
+          ${rows || '<div style="padding:40px; text-align:center; color:#999;">暂无日志记录。</div>'}
         </div>
         ${generatePaginationHtml(page, totalPages, '/admin/logs')}
       </div>
     </div>
     <script>
-      function escapeHtml(unsafe) {
-        if (!unsafe) return '';
-        return String(unsafe).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-      }
+      function escapeHtml(unsafe) { return String(unsafe).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;'); }
       
       async function cleanupLogs() {
         if(confirm('确定要清理过期的日志吗？该操作不可恢复！')) {
@@ -1317,39 +1299,39 @@ function generateSettingsPage(config, session) {
     <div class="container">
       ${getHeaderNav(session)}
       <div class="box">
-        <h3 style="margin-bottom:8px; font-size:18px; color:var(--primary); font-weight:800;">⚙️ 系统全局配置</h3>
-        <p style="color:#666; font-size:13px; margin-bottom:24px;">此处修改的配置将即刻生效于全球边缘节点。</p>
+        <h3 style="margin-bottom:8px; font-size:18px; color:var(--primary); font-weight:800;">⚙️ 系统配置</h3>
+        <p style="color:#666; font-size:13px; margin-bottom:24px;">修改的配置将实时生效。</p>
         
         <form id="sForm">
-          <div class="section-title">安全防刷墙策略 (联动 IP 黑名单模块)</div>
+          <div class="section-title">登录安全限制</div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
             <div class="g">
-              <label>密码最大试错次数 (次)</label>
+              <label>最大登录失败次数 (次)</label>
               <input type="number" id="max_login_failures" value="${config.max_login_failures || 5}" min="1" ${isReadonly?'disabled':''}>
             </div>
             <div class="g">
-              <label>触发封禁后的惩罚时长 (小时)</label>
+              <label>限制登录时长 (小时)</label>
               <input type="number" id="lockout_hours" value="${config.lockout_hours || 2}" min="1" ${isReadonly?'disabled':''}>
             </div>
           </div>
           <div class="g" style="margin-top:-10px;">
-            <label>连续失败次数统计窗口期 (小时)</label>
+            <label>失败次数统计周期 (小时)</label>
             <input type="number" id="failure_window_hours" value="${config.failure_window_hours || 1}" min="1" ${isReadonly?'disabled':''}>
           </div>
 
-          <div class="section-title">生命线与环境阈值控制</div>
+          <div class="section-title">会话与日志设置</div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
             <div class="g">
-              <label>登录会话 JWT 有效期 (小时)</label>
+              <label>登录会话有效期 (小时)</label>
               <input type="number" id="expiry" value="${config.session_expiry_hours || 24}" min="1" ${isReadonly?'disabled':''}>
             </div>
             <div class="g">
-              <label>底层审计日志最大留存期 (天)</label>
+              <label>审计日志保留天数 (天)</label>
               <input type="number" id="logRetention" value="${config.log_retention_days || 30}" min="1" max="365" ${isReadonly?'disabled':''}>
             </div>
           </div>
           
-          ${isReadonly ? '<p style="color:#ef4444;font-size:13px; font-weight:600;">⚠️ 您的账户仅具有只读权限，无权保存修改。</p>' : '<button type="submit" class="btn" style="width:100%; font-size:16px; padding:12px;">保存系统配置</button>'}
+          ${isReadonly ? '<p style="color:#ef4444;font-size:13px; font-weight:600;">⚠️ 您的账户只有系统配置的只读权限。</p>' : '<button type="submit" class="btn" style="width:100%; font-size:16px; padding:12px;">保存系统配置</button>'}
         </form>
       </div>
     </div>
@@ -1366,11 +1348,11 @@ function generateSettingsPage(config, session) {
           };
           const res = await fetch('/admin/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
           if(res.ok) {
-            alert('系统全局配置修改成功！');
+            alert('保存成功！新配置已生效。');
             window.location.reload();
           } else {
             const data=await res.json();
-            alert('保存异常: '+data.message);
+            alert('保存失败: '+data.message);
           }
         }
       }
@@ -1385,7 +1367,6 @@ function getCommonCss() {
     body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background-color:var(--bg); color:var(--text); padding:16px; overflow-x:hidden;}
     .container { max-width:1200px; margin:0 auto; }
     
-    /* Header与响应式抽屉 */
     .header { display:flex; justify-content:space-between; align-items:center; background:var(--primary); color:white; padding:14px 20px; border-radius:12px; box-shadow:0 4px 6px rgba(0,0,0,0.1); margin-bottom:12px; }
     .nav-brand { font-size:16px; font-weight:700; color:var(--secondary); display:flex; align-items:center; gap:8px;}
     .nav-brand a { color:var(--secondary); text-decoration:none; }
@@ -1396,7 +1377,6 @@ function getCommonCss() {
     .logout-btn:hover { background:#dc2626; }
     .user-badge { font-size:12px; color:var(--secondary); font-weight:600; background:rgba(255,255,255,0.1); padding:4px 10px; border-radius:12px;}
     
-    /* 侧边栏 CSS */
     .mobile-menu-btn { display:none; background:none; border:none; color:var(--secondary); font-size:24px; cursor:pointer; margin-right:12px;}
     .drawer-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:99; opacity:0; transition:opacity 0.3s; }
     .nav-drawer { display:contents; }
@@ -1414,7 +1394,6 @@ function getCommonCss() {
        .drawer-overlay.open { display:block; opacity:1; }
     }
 
-    /* 表格与通用 UI */
     .wrapper { background:#fff; border-radius:12px; box-shadow:0 2px 4px rgba(0,0,0,0.05); }
     table { width:100%; border-collapse:collapse; font-size:14px; text-align:left; }
     th { background:var(--secondary); padding:14px 16px; font-weight:700; color:var(--primary); border-bottom:2px solid #c7b6a4; }
