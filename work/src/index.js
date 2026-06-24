@@ -1,7 +1,7 @@
 import PostalMime from 'postal-mime';
 
 // ==========================================
-// 1. 数据库初始化 SQL
+// 1. 数据库初始化 SQL (新增 ip_blacklist 表)
 // ==========================================
 const CREATE_TABLES_SQL = `
 CREATE TABLE IF NOT EXISTS users (
@@ -61,6 +61,15 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_mailbox_id ON messages(mailbox_id);
 CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at);
+
+-- 新增：IP 黑名单专属管理表
+CREATE TABLE IF NOT EXISTS ip_blacklist (
+    ip TEXT PRIMARY KEY,
+    ban_type TEXT NOT NULL,
+    expires_at DATETIME,
+    reason TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 `;
 
 let tablesReady = false;
@@ -75,12 +84,8 @@ export default {
       const config = await getSystemConfig(env);
       if (config.allowed_domains && config.allowed_domains.length > 0) {
         const domain = toAddress.split('@')[1];
-        if (!config.allowed_domains.includes(domain)) {
-          console.warn(`⚠️ 拒收非白名单域名的邮件: ${toAddress}`);
-          return;
-        }
+        if (!config.allowed_domains.includes(domain)) return;
       }
-
       const parser = new PostalMime();
       const parsedEmail = await parser.parse(message.raw);
       
@@ -94,7 +99,7 @@ export default {
         `INSERT INTO messages (mailbox_id, from_address, subject, content, html_content) VALUES (?, ?, ?, ?, ?)`
       ).bind(mailbox.id, parsedEmail.from?.address || 'Unknown', parsedEmail.subject || '(无主题)',
         parsedEmail.text || parsedEmail.html || '(无内容)', parsedEmail.html || null).run();
-    } catch (error) { console.error('❌ 处理邮件失败:', error); }
+    } catch (error) { console.error('❌ 邮件处理失败:', error); }
   },
 
   async fetch(request, env, ctx) {
@@ -113,20 +118,13 @@ export default {
       const encoder = new TextEncoder();
       const salt = encoder.encode('cf_mail_worker_salt_fixed'); 
       const baseKey = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits', 'deriveKey']);
-      const derivedKey = await crypto.subtle.deriveKey(
-        { name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' },
-        baseKey, { name: 'AES-GCM', length: 256 }, true, ['encrypt']
-      );
+      const derivedKey = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt: salt, iterations: 100000, hash: 'SHA-256' }, baseKey, { name: 'AES-GCM', length: 256 }, true, ['encrypt']);
       const exported = await crypto.subtle.exportKey('raw', derivedKey);
       return Array.from(new Uint8Array(exported)).map(b => b.toString(16).padStart(2, '0')).join('');
     };
 
     const base64UrlEncode = (str) => btoa(str).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-    const base64UrlDecode = (str) => {
-      str = str.replace(/-/g, '+').replace(/_/g, '/');
-      while (str.length % 4) str += '=';
-      return atob(str);
-    };
+    const base64UrlDecode = (str) => { str = str.replace(/-/g, '+').replace(/_/g, '/'); while (str.length % 4) str += '='; return atob(str); };
 
     const generateJWT = async (payload) => {
       const header = { alg: 'HS256', typ: 'JWT' };
@@ -163,11 +161,12 @@ export default {
       if (!payload) return null;
       if (payload.user_id === 0) return payload;
 
-      const dbUser = await env.DB.prepare('SELECT token_version, disabled, permissions, accessible_emails FROM users WHERE id = ?').bind(payload.user_id).first();
+      const dbUser = await env.DB.prepare('SELECT email, token_version, disabled, permissions, accessible_emails FROM users WHERE id = ?').bind(payload.user_id).first();
       if (!dbUser || dbUser.disabled === 1 || dbUser.token_version !== payload.token_version) return null; 
 
       payload.permissions = JSON.parse(dbUser.permissions || '[]');
       payload.accessible_emails = JSON.parse(dbUser.accessible_emails || '[]');
+      payload.email = dbUser.email;
       return payload;
     };
 
@@ -177,13 +176,27 @@ export default {
       } catch (e) {}
     };
 
+    // 🧹 惰性黑名单清理机制（执行于每次关键查询前）
+    const cleanupBlacklist = async () => {
+      try {
+        const expired = await env.DB.prepare("SELECT ip FROM ip_blacklist WHERE ban_type = 'temporary' AND expires_at < datetime('now')").all();
+        if (expired && expired.results.length > 0) {
+          const ips = expired.results.map(r => r.ip);
+          const placeholders = ips.map(() => '?').join(',');
+          await env.DB.prepare(`DELETE FROM ip_blacklist WHERE ip IN (${placeholders})`).bind(...ips).run();
+          for(let ip of ips) {
+            await logAction(0, 'System', 'blacklist_expire', 'blacklist', ip, `临时封禁到期自动解封 IP: ${ip}`, true);
+          }
+        }
+      } catch (e) {}
+    };
+
     // --- API: 用户修改自身密码 ---
     if (path === '/api/change-password' && request.method === 'POST') {
       const session = await getSession();
       if (!session) return new Response(null, { status: 401 });
-      
-      if (session.role === 'superuser') return new Response(JSON.stringify({message: '超管账户不支持在此修改密码'}), {status: 403});
-      if (!session.permissions.includes('user:self:password')) return new Response(JSON.stringify({message: '您的账户没有修改密码的权限'}), {status: 403});
+      if (session.role === 'superuser') return new Response(JSON.stringify({message: '超管账户不支持在此修改'}), {status: 403});
+      if (!session.permissions.includes('user:self:password')) return new Response(JSON.stringify({message: '无权修改密码'}), {status: 403});
 
       const { oldPwd, newPwd } = await request.json();
       const user = await env.DB.prepare('SELECT password_hash FROM users WHERE id = ?').bind(session.user_id).first();
@@ -192,7 +205,7 @@ export default {
       
       const newHash = await hashPassword(newPwd);
       await env.DB.prepare('UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?').bind(newHash, session.user_id).run();
-      await logAction(session.user_id, session.username, 'update_user', 'user', session.user_id, '用户修改自身密码', true);
+      await logAction(session.user_id, session.username, 'update_user', 'user', session.user_id, '修改了自身密码', true);
       return new Response(JSON.stringify({success: true}));
     }
 
@@ -202,29 +215,23 @@ export default {
       return new Response(generateProfilePage(session), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    // --- 登录系统 ---
+    // --- 登录系统 (集成新版 D1 黑名单与高危提示) ---
     if (path === '/api/login' && request.method === 'POST') {
       try {
+        await cleanupBlacklist(); // 登录前先清洗过期黑名单
+
         const formData = await request.formData();
         const username = formData.get('username') || '';
         const password = formData.get('password') || '';
         const config = await getSystemConfig(env);
         const expiryHours = config.session_expiry_hours || 24;
 
-        if (config.ip_blacklist) {
-          const bl = config.ip_blacklist.split(';').map(ip => ip.trim()).filter(Boolean);
-          if (bl.includes(clientIp)) {
-            await logAction(-1, username, 'login', 'user', null, '触发黑名单IP拦截', false);
-            return new Response(JSON.stringify({ success: false, message: '当前 IP 已被管理员列入黑名单，禁止登录。' }), { status: 403 });
-          }
-        }
-
-        if (env.CONFIG_KV) {
-          const isLocked = await env.CONFIG_KV.get(`lockout:${clientIp}`);
-          if (isLocked) {
-             await logAction(-1, username, 'login', 'user', null, '触发IP频繁失败锁定拦截', false);
-             return new Response(JSON.stringify({ success: false, message: '失败次数过多，该 IP 已被限制登录请稍后再试。' }), { status: 429 });
-          }
+        // 1. D1 级黑名单校验
+        const banRecord = await env.DB.prepare('SELECT * FROM ip_blacklist WHERE ip = ?').bind(clientIp).first();
+        if (banRecord) {
+           await logAction(-1, username, 'login', 'user', null, `黑名单拦截: ${banRecord.reason}`, false);
+           const banMsg = banRecord.ban_type === 'permanent' ? '该 IP 已被永久封禁。' : `该 IP 处于临时封禁状态，解封时间: ${new Date(banRecord.expires_at + 'Z').toLocaleString('zh-CN')}`;
+           return new Response(JSON.stringify({ success: false, message: banMsg }), { status: 403 });
         }
 
         let isSuccess = false; let userId = -1; let userRole = ''; let userPerms = []; let tokenVer = 0;
@@ -235,7 +242,7 @@ export default {
           const user = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
           if (user) {
             if (user.disabled === 1) {
-              await logAction(user.id, username, 'login', 'user', user.id, '系统登录（账户被封禁）', false);
+              await logAction(user.id, username, 'login', 'user', user.id, '登录失败（账户被封禁）', false);
               return new Response(JSON.stringify({ success: false, message: '账户已被禁用' }), { status: 403 });
             }
             const inputHash = await hashPassword(password);
@@ -248,22 +255,30 @@ export default {
         if (isSuccess) {
           if (env.CONFIG_KV) await env.CONFIG_KV.delete(`fails:${clientIp}`); 
           const jwt = await generateJWT({ user_id: userId, username, role: userRole, permissions: userPerms, token_version: tokenVer, exp: Date.now() + (expiryHours * 60 * 60 * 1000) });
-          await logAction(userId, username, 'login', 'user', userId, '系统登录', true);
+          await logAction(userId, username, 'login', 'user', userId, '系统登录成功', true);
           return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json', 'Set-Cookie': `auth_token=${jwt}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${expiryHours * 3600}` } });
         } else {
+          // 密码错误：执行 KV 限流与自动封禁策略
           if (env.CONFIG_KV) {
             const failKey = `fails:${clientIp}`;
             let fails = parseInt((await env.CONFIG_KV.get(failKey)) || '0') + 1;
-            const windowSecs = Math.max(60, (config.failure_window_hours || 1) * 3600);
-            await env.CONFIG_KV.put(failKey, fails.toString(), { expirationTtl: windowSecs });
-            if (fails >= (config.max_login_failures || 5)) {
-              const lockoutSecs = Math.max(60, (config.lockout_hours || 2) * 3600);
-              await env.CONFIG_KV.put(`lockout:${clientIp}`, '1', { expirationTtl: lockoutSecs });
+            const maxFails = config.max_login_failures || 5;
+            const lockoutHours = config.lockout_hours || 2;
+            const remain = maxFails - fails;
+
+            if (fails >= maxFails) {
+              await env.DB.prepare("INSERT OR REPLACE INTO ip_blacklist (ip, ban_type, expires_at, reason) VALUES (?, 'temporary', datetime('now', ?), ?)").bind(clientIp, `+${lockoutHours} hours`, '密码错误超限自动封禁').run();
               await env.CONFIG_KV.delete(failKey);
+              await logAction(0, 'System', 'blacklist_add', 'blacklist', clientIp, `多次密码错误，自动封禁 IP: ${clientIp}`, true);
+              return new Response(JSON.stringify({ success: false, message: `多次认证失败，该 IP 已被限制登录 ${lockoutHours} 小时。` }), { status: 401 });
+            } else {
+              const windowSecs = Math.max(60, (config.failure_window_hours || 1) * 3600);
+              await env.CONFIG_KV.put(failKey, fails.toString(), { expirationTtl: windowSecs });
+              await logAction(-1, username, 'login', 'user', null, '密码或账号错误', false);
+              return new Response(JSON.stringify({ success: false, message: `用户名或密码错误。\n你还剩 ${remain} 次登录尝试，超过将被禁止登录 ${lockoutHours} 小时。` }), { status: 401 });
             }
           }
-          await logAction(-1, username, 'login', 'user', null, '系统登录（密码错误）', false);
-          return new Response(JSON.stringify({ success: false, message: '用户名或密码错误' }), { status: 401 });
+          return new Response(JSON.stringify({ success: false, message: '用户名或密码错误。' }), { status: 401 });
         }
       } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
     }
@@ -292,21 +307,24 @@ export default {
         let conditions = []; let bindParams = [];
 
         if (session.role !== 'superuser' && !hasPermission('mail:view:all')) {
-          if (session.accessible_emails && session.accessible_emails.length > 0) {
+          if (hasPermission('mail:view:own') && session.email) {
+            conditions.push(`mb.email = ?`); bindParams.push(session.email);
+          }
+          if (hasPermission('mail:view:allowed') && session.accessible_emails && session.accessible_emails.length > 0) {
             session.accessible_emails.forEach(allowed => {
               if (allowed.startsWith('@')) { conditions.push(`mb.email LIKE ?`); bindParams.push(`%${allowed}`); } 
               else { conditions.push(`mb.email = ?`); bindParams.push(allowed); }
             });
-          } else {
-            return new Response(generateListPage([], session, 1, 0), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
           }
+          if (conditions.length === 0) return new Response(generateListPage([], session, 1, 0), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+          baseSql += ` WHERE ${conditions.join(' OR ')}`;
         }
-        let whereClause = conditions.length > 0 ? ` WHERE ${conditions.join(' OR ')}` : '';
-        const countStmt = env.DB.prepare(`SELECT COUNT(*) as total ${baseSql} ${whereClause}`);
+
+        const countStmt = env.DB.prepare(`SELECT COUNT(*) as total ${baseSql}`);
         const countRes = await (bindParams.length > 0 ? countStmt.bind(...bindParams) : countStmt).first();
         const totalPages = Math.ceil(countRes.total / size);
 
-        const dataStmt = env.DB.prepare(`SELECT m.*, mb.email as mailbox_email ${baseSql} ${whereClause} ORDER BY m.received_at DESC LIMIT ? OFFSET ?`);
+        const dataStmt = env.DB.prepare(`SELECT m.*, mb.email as mailbox_email ${baseSql} ORDER BY m.received_at DESC LIMIT ? OFFSET ?`);
         const messages = await dataStmt.bind(...bindParams, size, offset).all();
         return new Response(generateListPage(messages.results, session, page, totalPages), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       } catch (e) { return new Response('系统错误: ' + e.message, { status: 500 }); }
@@ -363,7 +381,7 @@ export default {
       return new Response(JSON.stringify({ success: true, count: authorizedIds.length }));
     }
 
-    // --- 获取指定用户的操作日志 API ---
+    // --- 用户专属日志 ---
     const logMatch = path.match(/^\/api\/users\/(\d+)\/logs$/);
     if (logMatch && request.method === 'GET') {
       if (!hasPermission('user:manage:restricted') && !hasPermission('user:manage:all')) return new Response(JSON.stringify({error: 'Forbidden'}), {status: 403});
@@ -371,9 +389,7 @@ export default {
         const targetIdInt = parseInt(logMatch[1], 10);
         const logs = await env.DB.prepare(`SELECT * FROM audit_logs WHERE user_id = ? OR (target_type = 'user' AND target_id = ?) ORDER BY created_at DESC LIMIT 50`).bind(targetIdInt, String(targetIdInt)).all();
         return new Response(JSON.stringify({logs: logs.results}), {headers:{'Content-Type':'application/json'}});
-      } catch(e) {
-        return new Response(JSON.stringify({error: e.message}), {status: 500});
-      }
+      } catch(e) { return new Response(JSON.stringify({error: e.message}), {status: 500}); }
     }
 
     // --- 用户管理 ---
@@ -384,9 +400,14 @@ export default {
         const page = parseInt(url.searchParams.get('page')) || 1;
         const size = parseInt(url.searchParams.get('size')) || 20;
         const offset = (page - 1) * size;
-        const countRes = await env.DB.prepare('SELECT COUNT(*) as total FROM users').first();
+        
+        // 核心修复：受限管理员只能看到普通用户
+        let whereSql = '';
+        if (!hasPermission('user:manage:all')) whereSql = "WHERE role = 'user'";
+
+        const countRes = await env.DB.prepare(`SELECT COUNT(*) as total FROM users ${whereSql}`).first();
         const totalPages = Math.ceil(countRes.total / size);
-        const users = await env.DB.prepare('SELECT id, username, email, role, permissions, accessible_emails, disabled, created_at FROM users ORDER BY id DESC LIMIT ? OFFSET ?').bind(size, offset).all();
+        const users = await env.DB.prepare(`SELECT id, username, email, role, permissions, accessible_emails, disabled, created_at FROM users ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`).bind(size, offset).all();
         
         const parsedUsers = users.results.map(u => {
           let perms = [], emails = [];
@@ -400,22 +421,20 @@ export default {
       if (request.method === 'POST') {
         try {
           const body = await request.json();
-          const { action, id, username, password, role, permissions, accessible_emails, disabled } = body;
+          const { action, id, username, password, email, role, permissions, accessible_emails, disabled } = body;
 
-          // 【安全防线 1】：绝不允许低权限管理员篡改、创建出更高阶的 Admin 角色
-          if (!hasPermission('user:manage:all') && role === 'admin') {
-              return new Response(JSON.stringify({ success: false, message: '越权拦截：无权创建或提权为管理员' }), { status: 403 });
+          // 禁止自我修改
+          if ((action === 'update' || action === 'delete') && parseInt(id) === session.user_id) {
+             return new Response(JSON.stringify({ success: false, message: '禁止在用户管理面板修改或删除自身账户，请使用右上角账号安全页' }), { status: 403 });
           }
 
-          // 【安全防线 2】：提权漏洞修复。任何人分配的功能权限，必须被包含在操作者自身拥有的权限中！
+          if (!hasPermission('user:manage:all') && role === 'admin') return new Response(JSON.stringify({ success: false, message: '越权拦截：无权创建或提权为管理员' }), { status: 403 });
+
           if (session.role !== 'superuser') {
               const unauthorizedPerms = (permissions || []).filter(p => !session.permissions.includes(p));
-              if (unauthorizedPerms.length > 0) {
-                  return new Response(JSON.stringify({ success: false, message: '越权拦截：您不能赋予他人您自身都不具备的功能权限' }), { status: 403 });
-              }
+              if (unauthorizedPerms.length > 0) return new Response(JSON.stringify({ success: false, message: '越权拦截：不能赋予您自身不具备的功能权限' }), { status: 403 });
           }
 
-          // 【安全防线 3】：数据越界修复。分配白名单邮箱时，必须被包含在操作者的白名单内！
           if (session.role !== 'superuser' && !hasPermission('mail:view:all')) {
               const unauthorizedEmails = (accessible_emails || []).filter(targetEmail => {
                   return !(session.accessible_emails || []).some(allowed => {
@@ -423,14 +442,12 @@ export default {
                       return allowed === targetEmail;
                   });
               });
-              if (unauthorizedEmails.length > 0) {
-                  return new Response(JSON.stringify({ success: false, message: '越权拦截：您不能分配超脱于您自身管辖范围外的邮箱/域名' }), { status: 403 });
-              }
+              if (unauthorizedEmails.length > 0) return new Response(JSON.stringify({ success: false, message: '越权拦截：不能分配超出自身管辖范围的邮箱' }), { status: 403 });
           }
 
           if (action === 'create') {
             const pwdHash = await hashPassword(password);
-            const res = await env.DB.prepare(`INSERT INTO users (username, password_hash, role, permissions, accessible_emails, created_by) VALUES (?, ?, ?, ?, ?, ?)`).bind(username, pwdHash, role, JSON.stringify(permissions), JSON.stringify(accessible_emails), session.user_id).run();
+            const res = await env.DB.prepare(`INSERT INTO users (username, password_hash, email, role, permissions, accessible_emails, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(username, pwdHash, email || null, role, JSON.stringify(permissions), JSON.stringify(accessible_emails), session.user_id).run();
             await logAction(session.user_id, session.username, 'create_user', 'user', res.meta.last_row_id, `新增用户: ${username} [${role}]`, true);
             return new Response(JSON.stringify({ success: true }));
           }
@@ -438,11 +455,10 @@ export default {
           if (action === 'update') {
             const target = await env.DB.prepare('SELECT role, permissions, accessible_emails FROM users WHERE id = ?').bind(id).first();
             if (!target) return new Response(JSON.stringify({ success: false, message: '找不到用户' }), { status: 404 });
-            
             if (target.role === 'admin' && !hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '越权拦截：受限管理员无法修改全权管理员' }), { status: 403 });
 
-            let updateSql = `UPDATE users SET role = ?, permissions = ?, accessible_emails = ?, disabled = ?, token_version = token_version + 1`;
-            let params = [role, JSON.stringify(permissions), JSON.stringify(accessible_emails), disabled ? 1 : 0];
+            let updateSql = `UPDATE users SET email = ?, role = ?, permissions = ?, accessible_emails = ?, disabled = ?, token_version = token_version + 1`;
+            let params = [email || null, role, JSON.stringify(permissions), JSON.stringify(accessible_emails), disabled ? 1 : 0];
             if (password && password.trim() !== '') {
               const newHash = await hashPassword(password);
               updateSql += `, password_hash = ?`; params.push(newHash);
@@ -450,18 +466,16 @@ export default {
             updateSql += ` WHERE id = ?`; params.push(id);
             await env.DB.prepare(updateSql).bind(...params).run();
             
-            await logAction(session.user_id, session.username, 'update_user', 'user', id, `编辑用户信息: ${username}`, true);
+            await logAction(session.user_id, session.username, 'update_user', 'user', id, `更新用户信息: ${username}`, true);
             if (target.permissions !== JSON.stringify(permissions) || target.accessible_emails !== JSON.stringify(accessible_emails)) {
-              await logAction(session.user_id, session.username, 'update_permission', 'user', id, `修改了用户权限或可访问邮箱: ${username}`, true);
+              await logAction(session.user_id, session.username, 'update_permission', 'user', id, `修改了权限或可访问邮箱: ${username}`, true);
             }
             return new Response(JSON.stringify({ success: true }));
           }
 
           if (action === 'delete') {
             const target = await env.DB.prepare('SELECT role FROM users WHERE id = ?').bind(id).first();
-            if (target && target.role === 'admin' && !hasPermission('user:manage:all')) {
-                return new Response(JSON.stringify({ success: false, message: '越权拦截：无法删除管理员账户' }), { status: 403 });
-            }
+            if (target && target.role === 'admin' && !hasPermission('user:manage:all')) return new Response(JSON.stringify({ success: false, message: '越权拦截：无法删除管理员账户' }), { status: 403 });
             await env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
             await logAction(session.user_id, session.username, 'delete_user', 'user', id, `删除了用户 ID: ${id}`, true);
             return new Response(JSON.stringify({ success: true }));
@@ -470,19 +484,22 @@ export default {
       }
     }
 
-    // --- 日志管理页 ---
+    // --- 日志与黑名单专区 ---
     if (path === '/admin/logs' && hasPermission('log:view:all')) {
+      await cleanupBlacklist(); // 查看日志前顺便清洗黑名单
       const page = parseInt(url.searchParams.get('page')) || 1;
       const size = parseInt(url.searchParams.get('size')) || 20;
       const offset = (page - 1) * size;
       const countRes = await env.DB.prepare('SELECT COUNT(*) as total FROM audit_logs').first();
       const totalPages = Math.ceil(countRes.total / size);
       const logs = await env.DB.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ? OFFSET ?').bind(size, offset).all();
+      // 记录访问日志动作
+      await logAction(session.user_id, session.username, 'view_logs', 'log', null, `调阅了全局系统审计日志`, true);
       return new Response(generateLogPage(logs.results, session, page, totalPages), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
     if (path === '/admin/logs/cleanup' && request.method === 'POST') {
-      if (session.role !== 'superuser') return new Response(JSON.stringify({ success: false, message: '仅超级管理员可执行日志清理' }), { status: 403 });
+      if (session.role !== 'superuser') return new Response(JSON.stringify({ success: false, message: '仅超级管理员可执行' }), { status: 403 });
       try {
         const config = await getSystemConfig(env);
         const days = config.log_retention_days || 30;
@@ -511,6 +528,46 @@ export default {
       return new Response(JSON.stringify({ success: true }));
     }
 
+    // --- 新增：黑名单中心化管理页面 ---
+    if (path === '/admin/blacklist' && (hasPermission('blacklist:view') || session.role === 'superuser')) {
+      await cleanupBlacklist();
+      if (request.method === 'GET') {
+        const page = parseInt(url.searchParams.get('page')) || 1;
+        const size = parseInt(url.searchParams.get('size')) || 20;
+        const offset = (page - 1) * size;
+        const countRes = await env.DB.prepare('SELECT COUNT(*) as total FROM ip_blacklist').first();
+        const totalPages = Math.ceil(countRes.total / size);
+        const list = await env.DB.prepare('SELECT * FROM ip_blacklist ORDER BY created_at DESC LIMIT ? OFFSET ?').bind(size, offset).all();
+        return new Response(generateBlacklistPage(list.results, session, page, totalPages), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      }
+      
+      if (request.method === 'POST' && (hasPermission('blacklist:edit') || session.role === 'superuser')) {
+        try {
+          const body = await request.json();
+          if (body.action === 'add') {
+             let expiresAt = null;
+             if (body.ban_type === 'temporary') {
+                const addMinutes = (parseInt(body.days||0)*1440) + (parseInt(body.hours||0)*60) + parseInt(body.minutes||0);
+                if (addMinutes <= 0) return new Response(JSON.stringify({success:false, message:'临时封禁时间无效'}), {status:400});
+                expiresAt = `+${addMinutes} minutes`;
+             }
+             if (expiresAt) {
+                await env.DB.prepare(`INSERT OR REPLACE INTO ip_blacklist (ip, ban_type, expires_at, reason) VALUES (?, 'temporary', datetime('now', ?), ?)`).bind(body.ip, expiresAt, body.reason || '手动封禁').run();
+             } else {
+                await env.DB.prepare(`INSERT OR REPLACE INTO ip_blacklist (ip, ban_type, expires_at, reason) VALUES (?, 'permanent', NULL, ?)`).bind(body.ip, body.reason || '手动封禁').run();
+             }
+             await logAction(session.user_id, session.username, 'blacklist_add', 'blacklist', body.ip, `添加IP黑名单 (${body.ban_type}): ${body.ip}`, true);
+             return new Response(JSON.stringify({ success: true }));
+          } else if (body.action === 'delete') {
+             await env.DB.prepare('DELETE FROM ip_blacklist WHERE ip = ?').bind(body.ip).run();
+             await logAction(session.user_id, session.username, 'blacklist_delete', 'blacklist', body.ip, `手动解除了对IP的封禁: ${body.ip}`, true);
+             return new Response(JSON.stringify({ success: true }));
+          }
+        } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
+      }
+      return new Response('Forbidden', {status: 403});
+    }
+
     // --- 系统设置 ---
     if (path === '/admin/settings' && hasPermission('system:config:view')) {
       if (request.method === 'GET') {
@@ -521,17 +578,17 @@ export default {
       if (request.method === 'POST' && hasPermission('system:config:edit')) {
         try {
           const body = await request.json();
-          if (env.CONFIG_KV) {
-            const newConfig = {
-              log_retention_days: parseInt(body.log_retention_days, 10) || 30,
-              session_expiry_hours: parseInt(body.session_expiry_hours, 10) || 24,
-              max_login_failures: parseInt(body.max_login_failures, 10) || 5,
-              failure_window_hours: parseInt(body.failure_window_hours, 10) || 1,
-              lockout_hours: parseInt(body.lockout_hours, 10) || 2,
-              ip_blacklist: body.ip_blacklist || ""
-            };
-            await env.CONFIG_KV.put('system_config', JSON.stringify(newConfig));
-          }
+          const updateConfig = async (key, val) => {
+             await env.DB.prepare(`INSERT INTO system_config (key, value, updated_by, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated_at=CURRENT_TIMESTAMP`).bind(key, JSON.stringify(val), session.user_id).run();
+          };
+
+          await updateConfig('session_expiry_hours', parseInt(body.session_expiry_hours, 10) || 24);
+          await updateConfig('log_retention_days', parseInt(body.log_retention_days, 10) || 30);
+          await updateConfig('max_login_failures', parseInt(body.max_login_failures, 10) || 5);
+          await updateConfig('failure_window_hours', parseInt(body.failure_window_hours, 10) || 1);
+          await updateConfig('lockout_hours', parseInt(body.lockout_hours, 10) || 2);
+          await updateConfig('allowed_domains', body.allowed_domains || []);
+          
           await logAction(session.user_id, session.username, 'update_system_config', 'system_config', null, '修改了系统全局配置', true);
           return new Response(JSON.stringify({ success: true }));
         } catch (e) { return new Response(JSON.stringify({ success: false, message: e.message }), { status: 500 }); }
@@ -548,8 +605,9 @@ export default {
 function checkMailAccess(session, targetEmail, type) {
   if (session.role === 'superuser' || session.permissions.includes(`mail:${type}:all`)) return true;
   
-  if (session.permissions.includes(`mail:${type}:allowed`) || session.permissions.includes(`mail:${type}:own`)) {
-    if (!session.accessible_emails) return false;
+  if (session.permissions.includes(`mail:${type}:own`) && session.email === targetEmail) return true;
+  
+  if (session.permissions.includes(`mail:${type}:allowed`) && session.accessible_emails) {
     return session.accessible_emails.some(allowed => {
       if (allowed.startsWith('@')) return targetEmail.endsWith(allowed);
       return allowed === targetEmail;
@@ -559,10 +617,13 @@ function checkMailAccess(session, targetEmail, type) {
 }
 
 async function getSystemConfig(env) {
-  const defaultConfig = { log_retention_days: 30, session_expiry_hours: 24, max_login_failures: 5, failure_window_hours: 1, lockout_hours: 2, ip_blacklist: "" };
-  if (!env.CONFIG_KV) return defaultConfig;
-  const val = await env.CONFIG_KV.get('system_config', 'json');
-  return val ? { ...defaultConfig, ...val } : defaultConfig;
+  const rows = await env.DB.prepare('SELECT key, value FROM system_config').all();
+  const config = { log_retention_days: 30, session_expiry_hours: 24, max_login_failures: 5, failure_window_hours: 1, lockout_hours: 2, allowed_domains: [] };
+  rows.results.forEach(row => { 
+    try { config[row.key] = JSON.parse(row.value); } 
+    catch(e) { config[row.key] = row.value; } 
+  });
+  return config;
 }
 
 async function ensureTables(env) {
@@ -583,14 +644,25 @@ function getHeaderNav(session) {
   const hasUserManage = session.role === 'superuser' || session.permissions.includes('user:manage:restricted') || session.permissions.includes('user:manage:all');
   const hasLogs = session.role === 'superuser' || session.permissions.includes('log:view:all');
   const hasSettings = session.role === 'superuser' || session.permissions.includes('system:config:view');
+  const hasBlacklist = session.role === 'superuser' || session.permissions.includes('blacklist:view');
 
   return `
     <div class="header">
-      <div class="nav-brand"><a href="/">📬 邮件接收系统</a></div>
+      <div style="display:flex; align-items:center;">
+        <button class="mobile-menu-btn" onclick="document.getElementById('navDrawer').classList.add('open'); document.getElementById('drawerOverlay').classList.add('open');">☰</button>
+        <div class="nav-brand"><a href="/">📬 邮件接收系统</a></div>
+      </div>
+      <div class="user-badge">👤 ${escapeHtml(session.username)}</div>
+    </div>
+    
+    <div class="drawer-overlay" id="drawerOverlay" onclick="document.getElementById('navDrawer').classList.remove('open'); document.getElementById('drawerOverlay').classList.remove('open');"></div>
+    <div class="nav-drawer" id="navDrawer">
+      <div class="drawer-header">功能导航 <button style="background:none;border:none;color:inherit;font-size:24px;cursor:pointer;" onclick="document.getElementById('navDrawer').classList.remove('open'); document.getElementById('drawerOverlay').classList.remove('open');">×</button></div>
       <div class="nav-links">
         <a href="/" class="nav-item">收件箱</a>
         ${hasUserManage ? `<a href="/admin/users" class="nav-item">用户管理</a>` : ''}
-        ${hasLogs ? `<a href="/admin/logs" class="nav-item">审计日志</a>` : ''}
+        ${hasBlacklist ? `<a href="/admin/blacklist" class="nav-item">IP 黑名单</a>` : ''}
+        ${hasLogs ? `<a href="/admin/logs" class="nav-item">操作日志</a>` : ''}
         ${hasSettings ? `<a href="/admin/settings" class="nav-item">系统配置</a>` : ''}
         <a href="/profile" class="nav-item">账号安全</a>
         <a href="/logout" class="logout-btn">退出</a>
@@ -613,7 +685,7 @@ function generateProfilePage(session) {
   const isSuper = session.role === 'superuser';
   const canChange = session.permissions.includes('user:self:password') && !isSuper;
 
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>修改密码</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>账号安全</title>
   <style>${getCommonCss()}
     .box { background:#fff; padding:24px; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.05); max-width:500px; margin:0 auto; }
     .g { margin-bottom:16px; }
@@ -626,7 +698,7 @@ function generateProfilePage(session) {
       <div class="box">
         <h3 style="margin-bottom:16px; color:var(--primary);">🔒 修改密码</h3>
         ${isSuper ? '<p style="color:#ef4444; background:#fee2e2; padding:10px; border-radius:6px;">超管账户不支持在此页面修改密码。</p>' : ''}
-        ${!isSuper && !canChange ? '<p style="color:#ef4444; background:#fee2e2; padding:10px; border-radius:6px;">您的账户没有修改密码的权限，请联系管理员分配权限。</p>' : ''}
+        ${!isSuper && !canChange ? '<p style="color:#ef4444; background:#fee2e2; padding:10px; border-radius:6px;">您的账户没有修改密码的权限，请联系管理员分配。</p>' : ''}
         
         ${canChange ? `
         <form id="pwdForm">
@@ -654,7 +726,7 @@ function generateProfilePage(session) {
 }
 
 function generateLoginPage() {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>用户登录</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>系统登录</title>
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
     body { font-family:-apple-system,system-ui,sans-serif; background: #D8C7B5; min-height:100vh; display:flex; justify-content:center; align-items:center; padding:16px; color:#492D22; }
@@ -666,7 +738,7 @@ function generateLoginPage() {
     .g input { width:100%; padding:12px; border:1px solid #D8C7B5; border-radius:8px; font-size:14px; }
     .g input:focus { outline:none; border-color:#492D22; }
     .btn { width:100%; padding:12px; background:#492D22; color:#fff; border:none; border-radius:8px; font-size:15px; font-weight:600; cursor:pointer; }
-    .err { color:#ef4444; background:rgba(239,68,68,0.1); padding:10px; border-radius:6px; margin-bottom:16px; font-size:13px; display:none; }
+    .err { color:#ef4444; background:rgba(239,68,68,0.1); padding:10px; border-radius:6px; margin-bottom:16px; font-size:13px; display:none; white-space: pre-line; line-height:1.5; }
   </style></head>
   <body>
     <div class="card">
@@ -723,10 +795,9 @@ function generateListPage(messages, session, page, totalPages) {
     <div class="container">
       ${getHeaderNav(session)}
       <div class="top-card">
-         <div style="font-weight:600; color:var(--primary); margin-bottom:6px; font-size:15px;">当前登录用户: ${escapeHtml(session.username)}</div>
          <div style="font-size:13px; color:#555;">
-           <span style="font-weight:600; color:var(--primary);">可访问的邮箱白名单：</span><br>
-           ${session.role === 'superuser' || session.permissions.includes('mail:view:all') ? '- [拥有全局访问权限]' : (session.accessible_emails && session.accessible_emails.length > 0 ? session.accessible_emails.map(e => `- ${escapeHtml(e)}`).join('<br>') : '- [暂无分配的邮箱]')}
+           <span style="font-weight:600; color:var(--primary);">我可访问的邮箱白名单：</span><br>
+           ${session.role === 'superuser' || session.permissions.includes('mail:view:all') ? '- [拥有系统全局所有邮箱查阅权限]' : (session.accessible_emails && session.accessible_emails.length > 0 ? session.accessible_emails.map(e => `- ${escapeHtml(e)}`).join('<br>') : '- [暂未分配任何可访问的邮箱]')}
          </div>
       </div>
       
@@ -788,13 +859,17 @@ function generateDetailPage(message, session) {
 
 function generateUserPage(users, session, page, totalPages) {
   const AVAILABLE_PERMISSIONS = [
-    { key: 'mail:view:allowed', label: '查看授权箱/域邮件', desc: '允许查看白名单中指定的后缀邮件' },
+    { key: 'mail:view:own', label: '查看专属邮箱', desc: '允许查看自己绑定的专属邮箱邮件' },
+    { key: 'mail:view:allowed', label: '查看白名单邮箱', desc: '允许查看白名单中指定的后缀邮件' },
     { key: 'mail:view:all', label: '查看所有邮件', desc: '允许查看系统内所有邮件' },
-    { key: 'mail:delete:allowed', label: '删除授权箱/域邮件', desc: '允许删除白名单中指定的后缀邮件' },
+    { key: 'mail:delete:own', label: '删除专属邮箱邮件', desc: '允许删除自己专属邮箱的邮件' },
+    { key: 'mail:delete:allowed', label: '删除白名单邮箱邮件', desc: '允许删除白名单中指定的后缀邮件' },
     { key: 'mail:delete:all', label: '删除所有邮件', desc: '允许删除系统内所有邮件' },
     { key: 'user:manage:restricted', label: '受限管理普通用户', desc: '允许新增/编辑/删除普通用户' },
     { key: 'user:manage:all', label: '管理所有账户', desc: '允许管理包含管理员在内的所有账户' },
-    { key: 'user:self:password', label: '修改自身密码', desc: '允许当前用户在面板中修改自己的密码' },
+    { key: 'user:self:password', label: '修改自身密码', desc: '允许该用户在面板中修改自己的登录密码' },
+    { key: 'blacklist:view', label: '查看 IP 黑名单', desc: '允许只读访问黑名单面板' },
+    { key: 'blacklist:edit', label: '编辑 IP 黑名单', desc: '允许添加/移除 IP 黑名单' },
     { key: 'log:view:all', label: '查看审计日志', desc: '允许查看所有用户的操作日志' },
     { key: 'system:config:view', label: '查看系统配置', desc: '允许只读访问系统设置面板' },
     { key: 'system:config:edit', label: '修改系统配置', desc: '允许修改并保存系统全局设置' }
@@ -804,8 +879,9 @@ function generateUserPage(users, session, page, totalPages) {
     <tr>
       <td data-label="用户名" style="font-weight:600; color:var(--primary);">${escapeHtml(u.username)}</td>
       <td data-label="角色"><span class="badge">${u.role === 'admin' ? '管理员' : '普通用户'}</span></td>
+      <td data-label="专属邮箱">${escapeHtml(u.email || '未绑定')}</td>
       <td data-label="状态">${u.disabled ? '<span style="color:#ef4444;font-weight:600;">禁用</span>' : '<span style="color:#22c55e;font-weight:600;">正常</span>'}</td>
-      <td data-label="操作"><button class="btn" style="padding:6px 12px; font-size:13px;" onclick="editUserById(${u.id})">编辑用户</button></td>
+      <td data-label="操作"><button class="btn" style="padding:6px 12px; font-size:13px;" onclick="editUserById(${u.id})">编辑</button></td>
     </tr>
   `).join('');
 
@@ -815,6 +891,7 @@ function generateUserPage(users, session, page, totalPages) {
         <input type="checkbox" name="perms" value="${p.key}">
         <span><strong>${p.label}</strong> <code style="font-size:10px;color:var(--primary);background:var(--secondary);padding:1px 4px;border-radius:4px;">${p.key}</code></span>
       </label>
+      <div style="font-size:12px; color:#666; margin-top:4px; padding-left:24px;">${p.desc}</div>
     </div>
   `).join('');
 
@@ -844,6 +921,7 @@ function generateUserPage(users, session, page, totalPages) {
             <div><label style="display:block;margin-bottom:6px;font-size:13px;font-weight:600;">密码 <span id="pwdHint" style="font-weight:400;color:#666;"></span></label><input type="password" id="uPass" style="width:100%; padding:10px; border:1px solid var(--border); border-radius:6px;"></div>
           </div>
           <div class="f-grid">
+            <div><label style="display:block;margin-bottom:6px;font-size:13px;font-weight:600;">确认密码</label><input type="password" id="uPass2" style="width:100%; padding:10px; border:1px solid var(--border); border-radius:6px;"></div>
             <div><label style="display:block;margin-bottom:6px;font-size:13px;font-weight:600;">角色</label>
               <select id="uRole" style="width:100%; padding:10px; border:1px solid var(--border); border-radius:6px; background:#fff;">
                 <option value="user">普通用户 (USER)</option>
@@ -851,11 +929,14 @@ function generateUserPage(users, session, page, totalPages) {
               </select>
             </div>
           </div>
+          <div class="f-grid">
+            <div><label style="display:block;margin-bottom:6px;font-size:13px;font-weight:600;">专属邮箱绑定 (选填)</label><input type="text" id="uEmail" style="width:100%; padding:10px; border:1px solid var(--border); border-radius:6px;" placeholder="例如: admin@company.com"></div>
+          </div>
           
           <div style="margin-top:16px;">
             <div style="display:flex; justify-content:space-between; align-items:center;">
               <label style="font-size:14px; font-weight:700; color:var(--primary);">🛡️ 权限分配</label>
-              <div><button type="button" class="tpl-btn" onclick="applyTemplate('user')">普通用户模板</button><button type="button" class="tpl-btn" onclick="applyTemplate('admin')">管理员模板</button></div>
+              <div><button type="button" class="tpl-btn" onclick="applyTemplate('user')">普通模板</button><button type="button" class="tpl-btn" onclick="applyTemplate('admin')">管理模板</button></div>
             </div>
             <div class="perm-grid">${checkboxHtml}</div>
           </div>
@@ -881,8 +962,8 @@ function generateUserPage(users, session, page, totalPages) {
 
       <div class="wrapper" id="userListCard" style="overflow-x:auto;">
         <table>
-          <thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>操作</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="4" style="text-align:center;">暂无用户。</td></tr>'}</tbody>
+          <thead><tr><th>用户名</th><th>角色</th><th>专属邮箱</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5" style="text-align:center;">暂无用户。</td></tr>'}</tbody>
         </table>
         ${generatePaginationHtml(page, totalPages, '/admin/users')}
       </div>
@@ -906,8 +987,8 @@ function generateUserPage(users, session, page, totalPages) {
         const checkboxes = document.querySelectorAll('input[name="perms"]');
         checkboxes.forEach(cb => cb.checked = false);
         const tplMap = {
-          user: ['mail:view:allowed', 'mail:delete:allowed', 'user:self:password'],
-          admin: ['mail:view:all', 'mail:delete:all', 'user:manage:restricted', 'log:view:all', 'system:config:view', 'user:self:password']
+          user: ['mail:view:own', 'mail:view:allowed', 'mail:delete:own', 'mail:delete:allowed', 'user:self:password'],
+          admin: ['mail:view:all', 'mail:delete:all', 'user:manage:restricted', 'log:view:all', 'system:config:view', 'user:self:password', 'blacklist:view', 'blacklist:edit']
         };
         if (tplMap[role]) {
           tplMap[role].forEach(perm => {
@@ -918,13 +999,15 @@ function generateUserPage(users, session, page, totalPages) {
       }
       
       function showCreateForm() {
-        document.getElementById('userListCard').style.display = 'none'; // 隐藏底部列表
+        document.getElementById('userListCard').style.display = 'none'; 
         currentAction = 'create';
         document.getElementById('fTitle').innerText = '新增用户';
         document.getElementById('userId').value = '';
         document.getElementById('uName').value = ''; document.getElementById('uName').disabled = false;
         document.getElementById('uPass').required = true;
+        document.getElementById('uPass2').required = true;
         document.getElementById('pwdHint').innerText = '(必需项)';
+        document.getElementById('uEmail').value = '';
         document.getElementById('uRole').value = 'user';
         document.getElementById('uAccess').value = '';
         document.getElementById('uDisabled').checked = false;
@@ -936,13 +1019,15 @@ function generateUserPage(users, session, page, totalPages) {
       }
       
       async function editUser(u) {
-        document.getElementById('userListCard').style.display = 'none'; // 隐藏底部列表
+        document.getElementById('userListCard').style.display = 'none'; 
         currentAction = 'update';
         document.getElementById('fTitle').innerText = '编辑用户 - ' + u.username;
         document.getElementById('userId').value = u.id;
         document.getElementById('uName').value = u.username; document.getElementById('uName').disabled = true;
         document.getElementById('uPass').required = false;
+        document.getElementById('uPass2').required = false;
         document.getElementById('pwdHint').innerText = '(不修改密码请留空)';
+        document.getElementById('uEmail').value = u.email || '';
         document.getElementById('uRole').value = u.role;
         document.getElementById('uDisabled').checked = u.disabled === 1;
         
@@ -959,7 +1044,7 @@ function generateUserPage(users, session, page, totalPages) {
            const res = await fetch('/api/users/' + u.id + '/logs');
            if(!res.ok) throw new Error();
            const data = await res.json();
-           let html = '<h5 style="color:var(--primary); font-size:15px; margin-bottom:12px;">🔍 账户近期操作日志 (涵盖自己发起的操作以及对该账户的变更记录)</h5>';
+           let html = '<h5 style="color:var(--primary); font-size:15px; margin-bottom:12px;">🔍 账户近期操作日志 (涵盖自己发起的操作以及管理员对其的修改)</h5>';
            if(data.logs && data.logs.length === 0) {
              html += '<div style="color:#666;font-size:13px;">暂无该用户的操作记录。</div>';
            } else if (data.logs) {
@@ -969,7 +1054,7 @@ function generateUserPage(users, session, page, totalPages) {
                let desc = ''; try { desc = JSON.parse(l.details).description; } catch(e) { desc = l.details; }
                html += '<div style="font-size:13px; margin-bottom:10px; border-bottom:1px solid #f1f5f9; padding-bottom:10px; color:var(--text); line-height:1.4;">';
                html += '<div style="color:#64748b; font-size:12px; margin-bottom:4px;">'+new Date(l.created_at).toLocaleString()+' | 操作者: <strong style="color:var(--primary);">'+escapeHtml(l.username)+'</strong></div>';
-               html += '<div>' + st + ' <span style="background:var(--secondary); color:var(--primary); padding:1px 6px; border-radius:4px; font-weight:600; font-size:12px; margin-right:4px;">'+escapeHtml(l.action)+'</span> ' + escapeHtml(desc) + '</div>';
+               html += '<div>' + st + ' <span style="background:var(--secondary); color:var(--primary); padding:1px 6px; border-radius:4px; font-weight:600; font-size:12px; margin-right:4px;">'+l.action+'</span> ' + escapeHtml(desc) + '</div>';
                html += '</div>';
              });
              html += '</div>';
@@ -983,18 +1068,23 @@ function generateUserPage(users, session, page, totalPages) {
       
       function hideForm() { 
         document.getElementById('formCard').style.display = 'none'; 
-        document.getElementById('userListCard').style.display = 'block'; // 取消时恢复显示列表
+        document.getElementById('userListCard').style.display = 'block'; 
       }
       
       document.getElementById('uForm').onsubmit = async (e) => {
         e.preventDefault();
+        const p1 = document.getElementById('uPass').value;
+        const p2 = document.getElementById('uPass2').value;
+        if(p1 !== p2) return alert('两次输入的密码不一致！');
+
         const checkedPerms = Array.from(document.querySelectorAll('input[name="perms"]:checked')).map(cb => cb.value);
         const accessEmails = document.getElementById('uAccess').value.split('\\n').map(line => line.trim()).filter(Boolean);
         const body = {
           action: currentAction,
           id: document.getElementById('userId').value,
           username: document.getElementById('uName').value,
-          password: document.getElementById('uPass').value,
+          password: p1,
+          email: document.getElementById('uEmail').value,
           role: document.getElementById('uRole').value,
           permissions: checkedPerms,
           accessible_emails: accessEmails,
@@ -1007,7 +1097,105 @@ function generateUserPage(users, session, page, totalPages) {
       async function deleteUser() {
         if(confirm('确定要永久删除该账户吗？此操作不可逆转。')) {
           const res = await fetch('/admin/users', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ action: 'delete', id: document.getElementById('userId').value }) });
-          if(res.ok) window.location.reload(); else alert('删除失败，权限不足。');
+          if(res.ok) window.location.reload(); else alert('删除失败，可能由于权限不足。');
+        }
+      }
+    </script>
+  </body></html>`;
+}
+
+function generateBlacklistPage(list, session, page, totalPages) {
+  const rows = list.map(b => {
+    let typeBadge = b.ban_type === 'permanent' ? '<span style="color:#ef4444;font-weight:700;">永久封禁</span>' : 
+                   (b.ban_type === 'auto_ban' ? '<span style="color:#f59e0b;font-weight:700;">自动封禁</span>' : '<span style="color:#3b82f6;font-weight:700;">临时封禁</span>');
+    let expireTxt = b.expires_at ? new Date(b.expires_at + 'Z').toLocaleString('zh-CN') : '无期限';
+    return `
+      <tr>
+        <td data-label="封禁 IP" style="font-weight:600; color:var(--primary); font-family:monospace;">${escapeHtml(b.ip)}</td>
+        <td data-label="类型">${typeBadge}</td>
+        <td data-label="解封时间" style="font-size:13px;">${expireTxt}</td>
+        <td data-label="封禁事由" style="font-size:13px; color:#666;">${escapeHtml(b.reason || '-')}</td>
+        <td data-label="操作"><button class="del-btn" style="padding:4px 8px; font-size:12px;" onclick="delIp('${b.ip}')">解封 / 删除</button></td>
+      </tr>
+    `;
+  }).join('');
+
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>IP 黑名单管理</title>
+  <style>${getCommonCss()}
+    .m-card { background:#fff; padding:24px; border-radius:12px; margin-bottom:20px; display:none; border:1px solid var(--border); box-shadow:0 4px 6px rgba(0,0,0,0.05); border-left: 6px solid #dc2626; }
+    .g { margin-bottom:16px; }
+    .g label { display:block; margin-bottom:6px; font-weight:600; font-size:13px; }
+    .g input[type="text"], .g input[type="number"] { width:100%; padding:10px; border:1px solid var(--border); border-radius:6px; font-size:14px; }
+    @media(max-width:768px){ thead { display:none; } tr { display:block; background:#fff; border-radius:8px; margin-bottom:12px; padding:12px; box-shadow:0 1px 2px rgba(0,0,0,0.05);} td { display:flex; justify-content:space-between; padding:8px 0; border:none; text-align:right;} td::before { content:attr(data-label); color:var(--primary); font-weight:600; } }
+  </style></head>
+  <body>
+    <div class="container">
+      ${getHeaderNav(session)}
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+        <h3 style="font-size:16px; font-weight:700; color:var(--primary);">🛡️ IP 黑名单防御策略</h3>
+        <button class="btn" style="background:#dc2626;" onclick="showAdd()">+ 手动拉黑 IP</button>
+      </div>
+
+      <div class="m-card" id="formCard">
+        <h4 style="margin-bottom:16px; font-size:15px; font-weight:700; color:#dc2626; border-bottom:1px solid #fee2e2; padding-bottom:8px;">新增黑名单拦截</h4>
+        <form id="blForm">
+          <div class="g"><label>目标 IP 地址</label><input type="text" id="blIp" placeholder="例如 192.168.1.100" required></div>
+          <div class="g"><label>封禁类型</label>
+            <div style="display:flex; gap:16px; font-size:14px; padding:8px 0;">
+              <label style="font-weight:400; cursor:pointer;"><input type="radio" name="banType" value="permanent" checked onchange="toggleTime(this.value)"> 永久封禁</label>
+              <label style="font-weight:400; cursor:pointer;"><input type="radio" name="banType" value="temporary" onchange="toggleTime(this.value)"> 临时封禁 (倒计时)</label>
+            </div>
+          </div>
+          <div id="timeGroup" style="display:none; background:#faf9f7; padding:16px; border-radius:8px; margin-bottom:16px; border:1px solid var(--border);">
+            <div style="display:flex; gap:10px;">
+              <div style="flex:1;"><label>天数</label><input type="number" id="blD" min="0" value="0"></div>
+              <div style="flex:1;"><label>小时</label><input type="number" id="blH" min="0" value="1"></div>
+              <div style="flex:1;"><label>分钟</label><input type="number" id="blM" min="0" value="0"></div>
+            </div>
+          </div>
+          <div class="g"><label>封禁事由备注 (可选)</label><input type="text" id="blReason" placeholder="例如: 恶意攻击探测"></div>
+          <div style="display:flex; gap:10px;">
+            <button type="submit" class="btn" style="background:#dc2626;">执行封禁指令</button>
+            <button type="button" class="btn" style="background:var(--secondary); color:var(--primary);" onclick="hideAdd()">取消</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="wrapper" id="listCard" style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>拦截 IP</th><th>类型</th><th>自动解封时间</th><th>封禁事由</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5" style="text-align:center;">防御层目前没有黑名单数据。</td></tr>'}</tbody>
+        </table>
+        ${generatePaginationHtml(page, totalPages, '/admin/blacklist')}
+      </div>
+    </div>
+    
+    <script>
+      function showAdd() {
+        document.getElementById('listCard').style.display = 'none';
+        document.getElementById('formCard').style.display = 'block';
+      }
+      function hideAdd() {
+        document.getElementById('formCard').style.display = 'none';
+        document.getElementById('listCard').style.display = 'block';
+      }
+      function toggleTime(val) {
+        document.getElementById('timeGroup').style.display = val === 'temporary' ? 'block' : 'none';
+      }
+      document.getElementById('blForm').onsubmit = async (e) => {
+        e.preventDefault();
+        const type = document.querySelector('input[name="banType"]:checked').value;
+        const body = { action: 'add', ip: document.getElementById('blIp').value.trim(), ban_type: type, reason: document.getElementById('blReason').value };
+        if(type === 'temporary') {
+           body.days = document.getElementById('blD').value; body.hours = document.getElementById('blH').value; body.minutes = document.getElementById('blM').value;
+        }
+        const res = await fetch('/admin/blacklist', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+        if(res.ok) location.reload(); else alert('添加黑名单失败。');
+      };
+      async function delIp(ip) {
+        if(confirm('确定要解除对 IP ' + ip + ' 的封禁吗？')) {
+           const res = await fetch('/admin/blacklist', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'delete', ip:ip}) });
+           if(res.ok) location.reload(); else alert('解除封禁失败。');
         }
       }
     </script>
@@ -1028,7 +1216,10 @@ function generateLogPage(logs, session, page, totalPages) {
       'update_permission': { tag: '权限', color: '#7e22ce' },
       'view_logs': { tag: '日志', color: '#047857' },
       'cleanup_logs': { tag: '日志', color: '#047857' },
-      'access_denied': { tag: '安全', color: '#be123c' }
+      'access_denied': { tag: '安全', color: '#be123c' },
+      'blacklist_add': { tag: '黑名单', color: '#dc2626' },
+      'blacklist_delete': { tag: '黑名单', color: '#dc2626' },
+      'blacklist_expire': { tag: '黑名单', color: '#dc2626' }
     };
     return map[action] || { tag: '操作', color: '#666' };
   };
@@ -1073,7 +1264,7 @@ function generateLogPage(logs, session, page, totalPages) {
            <label style="font-size:13px; font-weight:600; color:var(--primary); cursor:pointer;"><input type="checkbox" onchange="document.querySelectorAll('.batch-cb').forEach(cb=>cb.checked=this.checked)" style="vertical-align:middle;"> 全选本页</label>
         </div>
         <div style="display:flex; flex-direction:column;">
-          ${rows || '<div style="padding:40px; text-align:center; color:#999;">暂无日志记录。</div>'}
+          ${rows || '<div style="padding:40px; text-align:center; color:#999;">暂无任何日志记录。</div>'}
         </div>
         ${generatePaginationHtml(page, totalPages, '/admin/logs')}
       </div>
@@ -1126,43 +1317,39 @@ function generateSettingsPage(config, session) {
     <div class="container">
       ${getHeaderNav(session)}
       <div class="box">
-        <h3 style="margin-bottom:8px; font-size:18px; color:var(--primary); font-weight:800;">⚙️ 系统配置</h3>
-        <p style="color:#666; font-size:13px; margin-bottom:24px;">修改的配置将实时生效。</p>
+        <h3 style="margin-bottom:8px; font-size:18px; color:var(--primary); font-weight:800;">⚙️ 系统全局配置</h3>
+        <p style="color:#666; font-size:13px; margin-bottom:24px;">此处修改的配置将即刻生效于全球边缘节点。</p>
         
         <form id="sForm">
-          <div class="section-title">登录安全限制</div>
+          <div class="section-title">安全防刷墙策略 (联动 IP 黑名单模块)</div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
             <div class="g">
-              <label>最大登录失败次数 (次)</label>
-              <input type="number" id="max_login_failures" value="${config.max_login_failures}" min="1" ${isReadonly?'disabled':''}>
+              <label>密码最大试错次数 (次)</label>
+              <input type="number" id="max_login_failures" value="${config.max_login_failures || 5}" min="1" ${isReadonly?'disabled':''}>
             </div>
             <div class="g">
-              <label>限制登录时长 (小时)</label>
-              <input type="number" id="lockout_hours" value="${config.lockout_hours}" min="1" ${isReadonly?'disabled':''}>
+              <label>触发封禁后的惩罚时长 (小时)</label>
+              <input type="number" id="lockout_hours" value="${config.lockout_hours || 2}" min="1" ${isReadonly?'disabled':''}>
             </div>
           </div>
           <div class="g" style="margin-top:-10px;">
-            <label>失败次数统计周期 (小时)</label>
-            <input type="number" id="failure_window_hours" value="${config.failure_window_hours}" min="1" ${isReadonly?'disabled':''}>
-          </div>
-          <div class="g">
-            <label>IP 黑名单 (用分号分隔)</label>
-            <textarea id="ip_blacklist" placeholder="192.168.1.1; 10.0.0.5" style="height:60px;" ${isReadonly?'disabled':''}>${config.ip_blacklist || ''}</textarea>
+            <label>连续失败次数统计窗口期 (小时)</label>
+            <input type="number" id="failure_window_hours" value="${config.failure_window_hours || 1}" min="1" ${isReadonly?'disabled':''}>
           </div>
 
-          <div class="section-title">会话与日志设置</div>
+          <div class="section-title">生命线与环境阈值控制</div>
           <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
             <div class="g">
-              <label>登录会话有效期 (小时)</label>
-              <input type="number" id="expiry" value="${config.session_expiry_hours}" min="1" ${isReadonly?'disabled':''}>
+              <label>登录会话 JWT 有效期 (小时)</label>
+              <input type="number" id="expiry" value="${config.session_expiry_hours || 24}" min="1" ${isReadonly?'disabled':''}>
             </div>
             <div class="g">
-              <label>审计日志保留天数 (天)</label>
-              <input type="number" id="logRetention" value="${config.log_retention_days}" min="1" max="365" ${isReadonly?'disabled':''}>
+              <label>底层审计日志最大留存期 (天)</label>
+              <input type="number" id="logRetention" value="${config.log_retention_days || 30}" min="1" max="365" ${isReadonly?'disabled':''}>
             </div>
           </div>
           
-          ${isReadonly ? '<p style="color:#ef4444;font-size:13px; font-weight:600;">⚠️ 您的账户只有系统配置的只读权限。</p>' : '<button type="submit" class="btn" style="width:100%; font-size:16px; padding:12px;">保存系统配置</button>'}
+          ${isReadonly ? '<p style="color:#ef4444;font-size:13px; font-weight:600;">⚠️ 您的账户仅具有只读权限，无权保存修改。</p>' : '<button type="submit" class="btn" style="width:100%; font-size:16px; padding:12px;">保存系统配置</button>'}
         </form>
       </div>
     </div>
@@ -1175,16 +1362,15 @@ function generateSettingsPage(config, session) {
             max_login_failures: document.getElementById('max_login_failures').value,
             failure_window_hours: document.getElementById('failure_window_hours').value,
             lockout_hours: document.getElementById('lockout_hours').value,
-            ip_blacklist: document.getElementById('ip_blacklist').value,
             log_retention_days: document.getElementById('logRetention').value
           };
           const res = await fetch('/admin/settings', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
           if(res.ok) {
-            alert('保存成功！新配置已生效。');
+            alert('系统全局配置修改成功！');
             window.location.reload();
           } else {
             const data=await res.json();
-            alert('保存失败: '+data.message);
+            alert('保存异常: '+data.message);
           }
         }
       }
@@ -1196,17 +1382,39 @@ function getCommonCss() {
   return `
     :root { --primary: #492D22; --secondary: #D8C7B5; --bg: #F4F1ED; --text: #333333; --border: #e2e8f0; }
     * { margin:0; padding:0; box-sizing:border-box; }
-    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background-color:var(--bg); color:var(--text); padding:16px; }
+    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background-color:var(--bg); color:var(--text); padding:16px; overflow-x:hidden;}
     .container { max-width:1200px; margin:0 auto; }
+    
+    /* Header与响应式抽屉 */
     .header { display:flex; justify-content:space-between; align-items:center; background:var(--primary); color:white; padding:14px 20px; border-radius:12px; box-shadow:0 4px 6px rgba(0,0,0,0.1); margin-bottom:12px; }
-    .nav-brand { font-size:16px; font-weight:700; color:var(--secondary); }
+    .nav-brand { font-size:16px; font-weight:700; color:var(--secondary); display:flex; align-items:center; gap:8px;}
     .nav-brand a { color:var(--secondary); text-decoration:none; }
     .nav-links { display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
     .nav-item { color:var(--secondary); text-decoration:none; font-size:14px; font-weight:600; transition:opacity 0.2s;}
     .nav-item:hover { opacity:0.8; }
     .logout-btn { padding:6px 12px; background:#ef4444; color:#fff; text-decoration:none; border-radius:6px; font-size:13px; font-weight:600; transition:0.2s;}
     .logout-btn:hover { background:#dc2626; }
-    .user-badge { font-size:12px; color:#666; margin-bottom:16px; padding-left:4px; font-weight:600; }
+    .user-badge { font-size:12px; color:var(--secondary); font-weight:600; background:rgba(255,255,255,0.1); padding:4px 10px; border-radius:12px;}
+    
+    /* 侧边栏 CSS */
+    .mobile-menu-btn { display:none; background:none; border:none; color:var(--secondary); font-size:24px; cursor:pointer; margin-right:12px;}
+    .drawer-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:99; opacity:0; transition:opacity 0.3s; }
+    .nav-drawer { display:contents; }
+    .drawer-header { display:none; }
+    
+    @media(max-width:768px) {
+       .mobile-menu-btn { display:block; }
+       .nav-links { display:none; }
+       .nav-drawer { display:block; position:fixed; top:0; left:-280px; width:260px; height:100vh; background:var(--primary); z-index:100; transition:left 0.3s cubic-bezier(0.4,0,0.2,1); padding:20px; box-shadow:4px 0 10px rgba(0,0,0,0.2); overflow-y:auto; }
+       .nav-drawer.open { left:0; }
+       .nav-drawer .nav-links { display:flex; flex-direction:column; align-items:flex-start; margin-top:20px; width:100%; gap:0; }
+       .nav-drawer .nav-item { width:100%; padding:14px 10px; border-bottom:1px solid rgba(255,255,255,0.1); font-size:15px; }
+       .nav-drawer .logout-btn { margin-top:20px; text-align:center; width:100%; padding:14px; }
+       .drawer-header { display:flex; justify-content:space-between; align-items:center; color:var(--secondary); font-size:18px; font-weight:bold; border-bottom:1px solid rgba(255,255,255,0.2); padding-bottom:16px; }
+       .drawer-overlay.open { display:block; opacity:1; }
+    }
+
+    /* 表格与通用 UI */
     .wrapper { background:#fff; border-radius:12px; box-shadow:0 2px 4px rgba(0,0,0,0.05); }
     table { width:100%; border-collapse:collapse; font-size:14px; text-align:left; }
     th { background:var(--secondary); padding:14px 16px; font-weight:700; color:var(--primary); border-bottom:2px solid #c7b6a4; }
